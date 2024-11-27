@@ -1,0 +1,180 @@
+-- TODO rewrite comments to (* *)
+comment "--";
+comment "(*" "*)";
+entrypoints Prog;
+
+-- Main
+
+Prog1. Prog ::= [Statement] ;
+
+separator Statement ";;" ;
+SDirective. Statement ::= "#" "use" FileName;
+SEnable. Statement ::= "#" "enable" String;
+SExpression. Statement ::= Expression;
+SExpressionWithType. Statement ::= Expression "::" Type; -- FIXME?
+SSignature. Statement ::= Signature;
+TypedefConstructors. TypedefDefinition ::= [Constructor] ;
+TypedefRecords. TypedefDefinition ::= "{" [RecordField] "}";
+STypedef. Statement ::= "type" Type "=" TypedefDefinition;
+SModuleContent. Statement ::= ModuleContent;
+
+EConst. Expression ::= Constant;
+EString. Expression ::= String;
+EVar. Expression ::= Variable;
+EOp1. Expression ::= PrefixOp Expression;
+EOp2. Expression ::= "(" Expression InfixOp Expression ")";
+ERecord. Expression ::= "{" [LabeledStatement] "}";
+EIfThenElse. Expression ::= "if" Expression "then" "{" Expression "}" "else" "{" Expression "}";
+EMatch. Expression ::= "match" [SimpleVariable] "with" "(" [Matching] ")" ;
+
+-- This enables type checking.
+-- `a -> String
+ETypeOf. Expression ::= "__typeof__" Expression ;
+
+-- Let binding
+RecNo. RecursivePrefix ::= ;
+RecYes. RecursivePrefix ::= "rec";
+
+SValue. Definition ::= "let" RecursivePrefix [Variable] "=" Expression;
+SExternal. Definition ::= "external" Variable ":" Type "=" String;
+ELocalDefinition. Expression ::= Definition "in" Expression; -- external should not be allowed..
+
+-- Imperative statements
+separator nonempty SequencingExpression ";";
+ESeq. SequencingExpression ::= Expression;
+EAssign. SequencingExpression ::= Variable "<-" Expression;
+EStack. Expression ::= "begin" [SequencingExpression] "end";
+ForTo. ForIterationType ::= "to";
+ForDownto. ForIterationType ::= "downto";
+EFor. Expression ::= "for" Variable "=" Expression ForIterationType Expression "do" [SequencingExpression] "done";
+EWhile. Expression ::= "while" Expression "do" [SequencingExpression] "done" ;
+
+-- Expressions
+
+separator Expression ",";
+separator LabeledStatement ";";
+SLabeled. LabeledStatement ::= Variable "=" Expression;
+SLabeledTyped. LabeledStatement ::= Variable "of" Type "=" Expression ;
+
+-- Function calls
+EFunctionCall. Expression ::= Variable "(" [Expression] ")";
+ERecursiveFunctionCall. Expression ::= Variable "rec" "(" [Expression] ";" Expression ")";
+FunctionPrefix1. FunctionPrefix ::= "function";
+FunctionPrefix2. FunctionPrefix ::= "fun"; -- anonymous functions
+ELambda. Expression ::= FunctionPrefix Matching ;
+
+-- Exceptions
+NException. ExceptionName ::= Ident ;
+SExceptionDefinition. ModuleContent ::=  "exception" ExceptionName "of" Type;
+ERaise. Expression ::= "raise" "(" ExceptionName Expression ")" ;
+
+-- Types
+separator nonempty Constructor "|";
+ConstructorEps. Constructor ::= Ident;
+ConstructorType. Constructor ::= Ident "of" Type;
+
+TBool. TypeConst ::= "bool";
+TInt. TypeConst ::= "int";
+TChar. TypeConst ::= "char";
+TFloat. TypeConst ::= "float";
+TString. TypeConst ::= "string";
+TUnit. TypeConst ::= "unit";
+
+TConstr. TypeConstr ::= Ident ;
+
+T1Const. Type2 ::= TypeConst;
+TIdent. Type2 ::= "`" Ident;
+TAlias. Type2 ::= TypeConstr;
+
+-- List with at least 2 parameters.
+TParameters2. TypeParameters ::= Type "," Type;
+TParametersN. TypeParameters ::= Type "," TypeParameters;
+TParameterized1. Type2 ::= Type2 TypeConstr;
+TParameterizedN. Type2 ::= "(" TypeParameters ")" TypeConstr;
+
+-- Hacky coercion Type 2;;
+_. Type2 ::= "(" Type ")";
+separator nonempty Type2 "*";
+TTuple. Type1 ::= [Type2];
+_. Type ::= Type1;
+TFunction. Type ::= Type1 "->" Type;
+
+separator nonempty Signature "";
+Signature1. Signature ::= "val" Variable "of" Type ;
+
+-- Typedef record
+MutableNo. Mutable ::= ;
+MutableYes. Mutable ::= "mutable";
+separator nonempty RecordField ";";
+TRecordField. RecordField ::= Mutable Ident ":" Type;
+
+-- Operators (very quirky...)
+-- Original grammar: https://caml.inria.fr/pub/docs/manual-ocaml/lex.html#infix-symbol
+
+-- core-operator-char ::= ["$|&*+-/=>@^|"]
+-- operator-char ::= ( ["~!?%<:."] | core-operator-char)
+token InfixSymbol (
+-- ( core-operator-char |  % |  < ) { operator-char }
+  ((["$&*+-/=>@^|%<"]) (["~!?%<:.$&*+-/=>@^|"]*))
+--  # { operator-char }+
+| ('#' (["~!?%<:.$&*+-/=>@^|"]+))
+);
+token PrefixSymbol (
+-- ! { operator-char }
+  ('!' (["~!?%<:.$&*+-/=>@^|"]*))
+-- (? |  ~) { operator-char }+
+| (["?~"] (["~!?%<:.$&*+-/=>@^|"]+))
+);
+
+token InfixSymbolOther (
+  '+' | '=' | '&' | {"-."} | {"!="} | {"<>"} | {"||"} | {"&&"} | {":="}
+| {"or"} | {"mod"} | {"land"} | {"lor"} | {"lxor"} | {"lsl"} | {"lsr"} | {"asr"}
+);
+token PrefixSymbolOther ('-' | {"-."});
+
+InfixOp1. InfixOp ::= InfixSymbol;
+InfixOp2. InfixOp ::= InfixSymbolOther;
+-- Tokens do not work correctly for those cases, because they are keywords..
+InfixOpSub. InfixOp ::= "-";
+InfixOpMul. InfixOp ::= "*";
+InfixOpAssign. InfixOp ::= "<-";
+PrefixOp1. PrefixOp ::= PrefixSymbol;
+PrefixOp2. PrefixOp ::= PrefixSymbolOther;
+PrefixOpMinus. PrefixOp ::= "-";
+OpNamePrefix. OperatorName ::= PrefixSymbol;
+OpNameInfix. OperatorName ::= InfixOp;
+
+-- Constants
+T. TupleConstr ::= "T";
+ETrue. Boolean ::= "true";
+EFalse. Boolean ::= "false";
+EBool. Constant ::= Boolean;
+EInt. Constant ::= Integer;
+EFloat. Constant ::= Double;
+EChar. Constant ::= Char;
+
+separator Variable "";
+VSimple. Variable ::= SimpleVariable;
+VOpTuple. Variable ::= TupleConstr;
+VOp. Variable ::= "(" OperatorName ")";
+
+separator SimpleVariable ",";
+VVariable. SimpleVariable ::= [Ident];
+VBlank. SimpleVariable ::= "_" ;
+
+-- Global variables
+separator nonempty Ident ".";
+
+-- Modules
+NFile. FileName ::= String ;
+SModuleSignature. Statement ::= "module" "type" Ident "=" "sig" [Signature] "end";
+SModuleName0. ModuleName ::= "module" Ident;
+SModuleName1. ModuleName ::= "module" Ident ":" Ident;
+SModuleDefinition. Statement ::= ModuleName "=" "struct" [ModuleContent] "end" ;
+
+separator ModuleContent ";;";
+SDefinition. ModuleContent ::= Definition ;
+
+-- Pattern matching
+Matching1. Matching ::= [Expression] "->" Expression ;
+separator nonempty Matching "|";

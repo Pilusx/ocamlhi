@@ -1,0 +1,37 @@
+# Automatically generated
+DocOcaml.txt
+LexOcaml.hs
+ParOcaml.hs
+
+# Cabal sandbox
+.cabal*
+cabal.project.local
+cabal.*
+dist/
+dist-newstyle/
+external/
+
+# Executables
+ocamlhi
+Test*
+
+# Python
+__pycache__
+
+# Other
+*.dot
+*.dyn_hi
+*.dyn_o
+*.html
+*.hsc
+*.hi
+
+*.log
+*.o
+*.reg
+*.zip
+
+.vscode/
+declaration/
+log/
+out/
