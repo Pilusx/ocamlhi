@@ -38,11 +38,11 @@ If you want to delete the container run:
 ```
 
 ## Tests
-https://github.com/user-attachments/assets/729a63cb-4d9e-451c-956f-52c6680be7bb
+https://github.com/user-attachments/assets/26670b33-96e3-4251-9810-69bef630f854
 
 | Index | Features      |
 | :---: | :--------------- |
-| 01 | Simple types : char, double, int, string|
+| 01 | Simple types: char, double, int, string|
 | 02 | Arithmetic, Comparisons |
 | 03 | Conditional expressions (if then else) |
 | 04 | Functions with multiple parameters, Recursion | 
@@ -78,6 +78,7 @@ You can also compare the results with the original OCaml interpreter (v.4.05.0).
 
 You can test the style of the source code by using:
 ```
+    make install_haskell
     make test_style
 ```
 

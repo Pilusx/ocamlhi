@@ -7,10 +7,10 @@ build:
 	cp dist/build/ocamlhi/ocamlhi ocamlhi
 
 build_docker:
-	(docker build 
-		-f docker/haskell9.dockerfile 
-		-t ocamlhi:${OCAMLHI_VERSION} 
-		.
+	(docker build \
+		-f docker/haskell9.dockerfile \
+		-t ocamlhi:${OCAMLHI_VERSION} \
+		. \
 	)
 
 run_docker:
@@ -74,6 +74,9 @@ format_ocaml:
 format_haskell:
 	hindent $(shell find src tests -regextype egrep -regex ".*\.hs$$" ! -regex ".*(Lexer|Parser|Print).*" -type f)
 	chmod 666 $(shell find src tests -name "*.hs" -type f)
+
+install_haskell:
+	cabal v1-install hindent-6.2.1 hlint-3.8
 
 install_asciinema:
 	apt-get install -y asciinema ffmpeg

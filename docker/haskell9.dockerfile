@@ -8,7 +8,6 @@ RUN pip3 install pylint
 RUN cabal update
 RUN cabal v1-install alex-3.5.1.0 happy-1.20.1.1 
 RUN cabal v1-install BNFC-2.9.5
-RUN cabal v1-install hindent-6.2.1 hlint-3.8 
 # RUN cabal v1-install homplexity # Does not work with base-4.19
 
 COPY . /app
