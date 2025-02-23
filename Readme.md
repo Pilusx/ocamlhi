@@ -38,7 +38,7 @@ If you want to delete the container run:
 ```
 
 ## Tests
-https://github.com/user-attachments/assets/26670b33-96e3-4251-9810-69bef630f854
+![GIF - Usage](./assets/demo.gif)
 
 | Index | Features      |
 | :---: | :--------------- |
