@@ -1,7 +1,7 @@
 # Automatically generated
 DocOcaml.txt
-LexOcaml.hs
-ParOcaml.hs
+Lexer.hs
+Parser.hs
 
 # Cabal sandbox
 .cabal*
@@ -19,19 +19,29 @@ Test*
 __pycache__
 
 # Other
+*.cast
 *.dot
 *.dyn_hi
 *.dyn_o
+*.gif
 *.html
 *.hsc
 *.hi
+*.mp4
 
 *.log
-*.o
 *.reg
 *.zip
 
+*.o
+*.a
+*.so
+*.cma
+*.cmxa
+*.cmi
+*.cmo
+*.cmx
+
 .vscode/
-declaration/
 log/
 out/

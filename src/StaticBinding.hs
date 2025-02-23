@@ -1,389 +1,454 @@
-module StaticBinding (
-  fvBind,
-  fvUnbind,
-  toLabeledStatementFromModuleContent,
-  toLabeledStatementFromDefinition
+{-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
+{-# OPTIONS_GHC -Wno-incomplete-uni-patterns #-}
+
+module StaticBinding
+  ( bind
   ) where
 
 import Control.Lens ((^.), over)
 import Control.Monad (forM)
-import Control.Monad.Except (catchError)
-import Control.Monad.Reader (local)
-import Control.Monad.Trans.State (modify, get)
-import qualified Data.Map as Map
-import qualified Data.Maybe as Maybe
-import Debug.Trace (trace)
+import Control.Monad.Reader (lift, local)
+import Control.Monad.State (modify)
+import qualified Data.Set as Set
 
 import Context
 import Grammar
-import Memory
-import PrintOcaml
-import UtilsOcaml
+import PatternMatching
+import Print
+import Types
 
--- Binding names.
+splitPath :: Path -> [[OIdent]] -> [[OIdent]]
+splitPath [] res = map reverse $ reverse res
+splitPath _ ([]:_) = undefined
+splitPath (p:ps) [] = splitPath ps [[p]]
+splitPath (p:ps) ((s:s'):ss) =
+  splitPath ps
+    $ if isUppercase p == isUppercase s
+        then (p : s : s') : ss
+        else [p] : (s : s') : ss
 
--- Checks whether the given field is a private module member.
-fvIsPrivate :: (Ident, NName) -> AResult Bool
-fvIsPrivate (modname, fields) = case fields of
-  [] -> return False
-  (i:_) -> do
-    context <- get
-    case Map.lookup modname (context ^. hmodules . implements) of
-      Nothing -> return False
-      Just signame -> case Map.lookup signame (context ^. hmodules . signatures) of
-        Nothing -> 
-          badInternal 5 $ "There is no module signature with given name: " ++ printTree signame
-        Just sigs -> 
-          return . not . any (\(Signature1 (VSimple (VVariable [i2])) _) -> i == i2) $ sigs
-
-fvCanonicalize :: NName -> AResult (Ident, NName)
-fvCanonicalize name@(x:xs) = do
-  context <- get
-  modname <- fvLastModule x
-  scope <- askE
-  case modname of
-    Just m | scope ^. modulename == modname -> return (m, xs) -- We are in the same module.
-    Just m -> do
-      b <- fvIsPrivate (m, xs)
-      if b then bad "Private field." else return (m, xs)
-    Nothing | scope ^. islocal -> return (Ident ".local", name)
-    _ -> case scope ^. modulename of
-      Nothing -> return (Ident ".global", name)
-      Just m -> return (m, name)
-
-fvUnbind :: CanonicalIndex -> Result
-fvUnbind cindex =
-  modify $ over hversionmanager (Map.alter (\(Just x) -> Just $ x-1) cindex)  
-
-fvNext :: (Ident, NName) -> AResult CanonicalName
-fvNext (modname, names) = do
-  let index = (modname, head names)
-
-  -- Increment version.
-  modify $ over hversionmanager (Map.alter maybeIncrement index)
-
-  context <- get
-  case Map.lookup index (context ^. hversionmanager) of
-    Just v -> return $ CanonicalName {
-        cindex = index,
-        version = v,
-        recordidents = tail names
-      }
-    _ -> undefined
-
-fvLast :: (Ident, NName) -> AResult (Maybe CanonicalName)
-fvLast (modname, names) = do
-  let index = (modname, head names)
-  context <- get
-  scope <- askE
-
-  let indexer v = return $ Just CanonicalName {
-      cindex = index,
-      version = v,
-      recordidents = tail names
-    }
-  
-  if scope ^. islocal
-    -- We have found a local variable.
-    then case Map.lookup index (scope ^. localversionmanager) of 
-      Just v -> indexer v
-      Nothing -> return Nothing
-    -- We are looking for the last global variable.
-    else case Map.lookup index (context ^. hversionmanager) of 
-      Just v -> indexer v
-      Nothing -> return Nothing
-
--- Binding modules.
-
-fvModuleIndexer :: Ident -> Int -> Ident
-fvModuleIndexer (Ident i) v = Ident $ i ++ "." ++ show v 
-
-fvNextModule :: Ident -> AResult Ident
-fvNextModule modname = do
-  modify $ over (hmodules . lastindex) (Map.alter maybeIncrement modname)
-  Just modname' <- fvLastModule modname
-  return modname'
-
-fvLastModule :: Ident -> AResult (Maybe Ident)
-fvLastModule modname@(Ident i) = do
-  context <- get
-  case Map.lookup modname (context ^. hmodules . lastindex) of
-    Nothing -> return Nothing
-    Just index -> return . Just $ fvModuleIndexer modname index
-
-fvLastModuleDocs :: (Ident, NName) -> AResult (Maybe CanonicalName)
-fvLastModuleDocs (modname, names) = return $ case names of
-  [] -> Just $ CanonicalModule modname
-  _ -> Nothing
-
--- Local bindings.
-
-fvInsert :: Variable -> ScopeM -> ScopeM
-fvInsert v = case v of
-  VSimple (VCanonical (CanonicalName index version _)) ->
-    pushScopedVariableVersion index version
-  VSimple VBlank -> id
-  _ -> undefined
-
-fvInsertN :: [Variable] -> ScopeM -> ScopeM
-fvInsertN vs = compose (map fvInsert vs)
-
-fvPushMatching :: Expression -> (ScopeM -> ScopeM)
-fvPushMatching x = case x of
-  ERecord lstmts ->
-    compose $ map (\(SLabeled v e) -> fvPushMatching e) lstmts
-  ETuple exprs ->
-    compose $ map fvPushMatching exprs
-  ENamedTuple name exprs ->
-    compose $ map fvPushMatching exprs
-  EVar pv -> case pv of
-    VSimple VBlank -> id
-    VSimple _ -> fvInsert pv
-    VConstructor _ -> id
-    _ -> throwBadMatching (-1) $ show pv
-  EConst _  -> id
-  _ -> throwBadMatching (-2) $ show x
-
+writeVersion :: Path -> (Integer, Bool) -> InterpreterT ()
+writeVersion path ver = do
+  context <- getContext
+  _ <- write path ver (context ^. hversions)
+  return ()
 
 class StaticBinding a where
-  fvBind :: Binder a
-  fvBind = return
+  bind :: a -> InterpreterT a
+  bind = return
 
 instance StaticBinding a => StaticBinding [a] where
-  fvBind = mapM fvBind
+  bind = mapM bind
 
-instance StaticBinding ExceptionName
-instance StaticBinding FunctionPrefix
-instance StaticBinding Type
+bindOp2 :: BNFC'Position -> Infix -> Expr -> Expr -> InterpreterT Expr
+bindOp2 pos op e1 e2 = do
+  pos' <- getPosition pos
+  op' <- bind $ Variable npos [IInfix npos op]
+  e1' <- bind e1
+  e2' <- bind e2
+  return $ EApply pos' op' [e1', e2']
 
-instance StaticBinding SequencingExpression where
-  fvBind x = case x of
-    ESeq exprs -> do
-      exprs' <- fvBind exprs
-      return $ ESeq exprs'
-    EAssign v e -> do
-      v' <- fvBind v
-      e' <- fvBind e
-      return $ EAssign v' e'
+bindMultiplication :: BNFC'Position -> [Expr] -> InterpreterT Expr
+bindMultiplication pos es = do
+  op <- bind $ Variable pos [IInfix npos $ OpMulInt npos]
+  es' <- bind es
+  return $ foldl1 (\x y -> EApply npos op [x, y]) es'
 
-fvBindOp :: String -> AResult Variable
-fvBindOp name =
-  fvBind $ VSimple $ VVariable [Ident $ "(" ++ name ++ ")"]
+instance StaticBinding Field where
+  bind x = do
+    scope <- getScope
+    case (scope ^. hasNameContext, x) of
+      (CtxUsage, EField _ (Variable _ [ILowercase _ i]) e) -> do
+        let v' = VCanonical npos (CanonicalField i)
+        e' <- bind e
+        return $ EField npos v' e'
+      (CtxGlobal, EFieldDecl _ (Variable _ [ILowercase _ i]) t) -> do
+        let v' = VCanonical npos (CanonicalField i)
+        t' <- local (setTag TagType) (bind t)
+        return $ EFieldDecl npos v' t'
+      (CtxGlobal, EFieldDeclMut _ (Variable _ [ILowercase _ i]) t) -> do
+        let v' = VCanonical npos (CanonicalField i)
+        t' <- local (setTag TagType) (bind t)
+        lift $ modify $ over (htypes . mutablefields) (Set.insert i)
+        return $ EFieldDeclMut npos v' t'
+      _ -> bad Nothing $ "Invalid record usage..." ++ show x
 
-instance StaticBinding Expression where
-  fvBind x = case x of
-    EConst _ -> return x
-    EString _ -> return x
-    EVar v -> EVar <$> fvBind v
-    EReferenceMemory _ -> return x
-    EOp1 op e1 -> do
-      e1' <- fvBind e1
-      v' <- fvBindOp $ case op of
-        -- Internally ops in -3 and (3 - 3) have to be distinguishable..
-        PrefixOpMinus ->  "~" ++ printTree op
-        _ -> printTree op 
-      return $ EFunctionCall v' [e1']
-    EOp2 e1 op e2 -> do
-      [e1', e2'] <- forM  [e1, e2] fvBind
-      v' <- fvBindOp $ printTree op
-      return $ EFunctionCall v' [e1', e2']
-    ERecord lstmts -> ERecord <$> fvBind lstmts
-    ERecordMemory _ -> return x
-    EIfThenElse e1 e2 e3 -> EIfThenElse <$> fvBind e1 <*> fvBind e2 <*> fvBind e3
-    EMatch simplevariables matchings -> do
-      sv <- fvBind simplevariables
-      ms <- local (fvInsertN (map VSimple sv)) (fvBind matchings)
-      return $ EMatch sv ms
-    ETypeOf e -> ETypeOf <$> fvBind e
-    ELocalDefinition vd e -> do
-      vd'@(SValue _ (name':_) _) <- local setLocal (fvBind vd)
-      e' <- local (fvInsert name') (fvBind e)
-      return $ ELocalDefinition vd' e'
-    EStack exprs -> EStack <$> fvBind exprs
-    EFor variable expr_start op expr_end expr_loop -> do
-      v' <- local (setLocal . setNext) (fvBind variable)
-      -- [TODO] Assert that there are no record idents in v', and that v' is not a constructor.
-      e_start' <- fvBind expr_start
-      e_end' <- fvBind expr_end
-      e_loop' <- local (fvInsert v') (fvBind expr_loop)
-      return $ EFor v' e_start' op e_end' e_loop'
-    EWhile e exprs -> EWhile <$> fvBind e <*> fvBind exprs
-    EFunctionCall v exprs -> EFunctionCall <$> fvBind v <*> fvBind exprs
-    EExternalFunctionCall _ _ -> return x
-    ETuple exprs -> ETuple <$> fvBind exprs
-    ENamedTuple name exprs -> ENamedTuple name <$> fvBind exprs
-    ERecursiveFunctionCall v exprs e -> ERecursiveFunctionCall <$> fvBind v <*> fvBind exprs <*> fvBind e
-    ELambda prefix matching -> ELambda prefix <$> fvBind matching
-    ERaise name e -> ERaise <$> fvBind name <*> fvBind e
-    ENull -> return x
+bindType :: Expr -> InterpreterT Expr
+bindType x =
+  case x of
+    EApply _ v [c] -> TPolymorphic npos <$> bind v <*> return c
+    EApply _ v cs
+      | length cs > 1 ->
+        TPolymorphic npos
+          <$> bind (EApply npos v (init cs))
+          <*> return (last cs)
+    ETuple _ e es -> TParams npos <$> bind (e : es)
+    TFunction pos t1 t2 -> TFunction pos <$> bind t1 <*> bind t2
+    TIdent {} -> return x
+    TTuple _ e1 es -> TTuple npos <$> bind e1 <*> bind es
+    Variable {} -> return x
+    _ -> bad Nothing $ "Cannot bind invalid type " ++ show x
 
-instance StaticBinding LabeledStatement where
-  fvBind x = case x of
-    SLabeled variable expression -> do
-      e <- fvBind expression
-      return $ SLabeled variable e
-    SLabeledTyped variable type_ expression -> do
-      e <- fvBind expression
-      let type_' = typeFlatten type_
-      return $ SLabeledTyped variable type_' e
+bindPattern :: Expr -> InterpreterT Expr
+bindPattern x = do
+  case x of
+    Blank pos -> Blank <$> getPosition pos
+    EAppend pos e1 e2 -> EAppend <$> getPosition pos <*> bind e1 <*> bind e2
+  -- This is a n-parameter constructor.
+    EApply pos v [e] -> do
+      pos' <- getPosition pos
+      v' <- local (setTag TagExpression . setNameContext CtxUsage) (bind v)
+      EConstructor pos' v' <$> bind e
+    EConstant {} -> return $ stripPosition x
+    ETuple pos e1 es -> ETuple <$> getPosition pos <*> bind e1 <*> mapM bind es
+    List pos es -> List <$> getPosition pos <*> bind es
+    Nil1 pos -> Nil2 <$> getPosition pos
+    Nil2 pos -> Nil2 <$> getPosition pos
+    Record pos fields ->
+      Record
+        <$> getPosition pos
+        <*> mapM
+              (\case
+                 EField _ (Variable _ [ILowercase _ i]) e -> do
+                   let name' = VCanonical npos $ CanonicalField i
+                   e' <- bind e
+                   return $ EField npos name' e'
+                 _ -> do
+                   pos' <- getPosition (hasPosition x)
+                   bad pos' $ "Invalid pattern (record), got " ++ show x)
+              fields
+  -- This is a 0-parameter constructor.
+    Variable pos name
+      | all isUppercase name -> do
+        pos' <- getPosition pos
+        VCanonical _ name' <-
+          local (setTag TagExpression . setNameContext CtxUsage) (bind x)
+        return . EConstant pos' $ CConstructor npos (to name' :: Path)
+    Variable {} -> local (setTag TagExpression) (bind x)
+    _ -> do
+      pos' <- getPosition (hasPosition x)
+      bad pos' $ "Invalid pattern, got " ++ show x
 
-fvAlternative :: [AResult a] -> AResult a
-fvAlternative (x:xs) =
-  case xs of 
-    [] -> x
-    _ -> x `catchError` \_ -> fvAlternative xs
+bindExpression :: Expr -> InterpreterT Expr
+bindExpression =
+  \case
+    Blank pos -> Blank <$> getPosition pos
+    EApply pos v es -> do
+      scope <- getScope
+      pos' <- getPosition pos
+      case scope ^. hasNameContext of
+        CtxDeclaration ->
+          case v of
+            Variable _ [_] -> do
+              v' <- local (setNameContext CtxDeclaration) (bind v)
+              params' <- local (setNameContext CtxLocal) (bind es)
+              return $ EApply pos' v' params'
+            _ -> bad pos' $ "Invalid function name, got " ++ printTree v
+        CtxUsage -> EApply pos' <$> bind v <*> bind es
+        _ ->
+          EApply pos' <$> bind v <*> local (setNameContext CtxLocal) (bind es)
+    EBegin pos e -> EBegin <$> getPosition pos <*> bind e
+    x@EConstant {} -> return $ stripPosition x
+    EFor pos (LetPattern _ v@(Variable _ [_]) e1) dir e2 e3 -> do
+      pos' <- getPosition pos
+      v'@(VCanonical _ name) <- local (setNameContext CtxLocal) (bind v)
+      e1' <- bind e1
+      [e2', e3'] <- local (setVisibleLocal name) (bind [e2, e3])
+      return $ EFor pos' (LetPattern npos v' e1') dir e2' e3'
+    EIf pos c e -> EIf <$> getPosition pos <*> bind c <*> bind e
+    EIfElse pos c e1 e2 ->
+      EIfElse <$> getPosition pos <*> bind c <*> bind e1 <*> bind e2
+    ELambda pos f es e -> do
+      pos' <- getPosition pos
+      es' <- local (setNameContext CtxLocal) (bind es)
+      e' <- dummyPrepare es' (bind e)
+      return $ ELambda pos' f es' e'
+    ELambdaTyped pos f es t e -> do
+      pos' <- getPosition pos
+      es' <- local (setNameContext CtxLocal) (bind es)
+      t' <- local (setTag TagType) (bind t)
+      e' <- dummyPrepare es' (bind e)
+      return $ ELambdaTyped pos' f es' t' e'
+    ELetIn pos rec patterns e -> do
+      pos' <- getPosition pos
+      patterns' <-
+        mapM
+          (\case
+             LetPattern pos2 v expr -> do
+               LetPattern
+                 <$> getPosition pos2
+                 <*> local (setNameContext CtxLocal) (bind v)
+                 <*> return expr
+             other -> do
+               pos2' <- getPosition (hasPosition other)
+               bad pos2' $ "Expected a let pattern, got... " ++ printTree other)
+          patterns
+      locals <-
+        mapM
+          (\case
+             LetPattern _ v _ -> return v
+             _ -> undefined)
+          patterns'
+      patterns'' <-
+        mapM
+          (\case
+             LetPattern pos2 v expr ->
+               case rec of
+                 RecYes _ -> LetPattern pos2 v <$> dummyPrepare [v] (bind expr)
+                 RecNo _ ->
+                   case v of
+                     EApply _ _ es ->
+                       LetPattern pos2 v <$> dummyPrepare es (bind expr)
+                     ETyped _ (VCanonical {}) _ ->
+                       LetPattern pos v <$> bind expr
+                     ETyped _ (EApply _ _ es) _ ->
+                       LetPattern pos2 v <$> dummyPrepare es (bind expr)
+                     _ -> LetPattern pos2 v <$> bind expr
+             _ -> undefined)
+          patterns'
+      ELetIn pos' rec patterns'' <$> dummyPrepare locals (bind e)
+    EMatch pos e p es -> do
+      pos' <- getPosition pos
+      e' <- bind e
+      es' <-
+        mapM
+          (\case
+             TFunction pos2 pat expr -> do
+               pos2' <- getPosition pos2
+               pat' <-
+                 local (setTag TagPattern . setNameContext CtxLocal) (bind pat)
+               expr' <- dummyPrepare [pat'] (bind expr)
+               return $ ELambda pos2' (Fun1 npos) [pat'] expr'
+             other -> do
+               pos2' <- getPosition (hasPosition other)
+               bad pos2' $ "Invalid expression in matching " ++ show other)
+          es
+      return $ EMatch pos' e' p es'
+    ESeq pos e es -> ESeq <$> getPosition pos <*> bind e <*> bind es
+    ETuple pos e es -> ETuple <$> getPosition pos <*> bind e <*> bind es
+    ETyped pos v t -> do
+      v' <- bind v
+      t' <- local (setTag TagType) (bind t)
+      return $ ETyped pos v' t'
+    EWhile pos c e -> EWhile <$> getPosition pos <*> bind c <*> bind e
+    List pos es -> List <$> getPosition pos <*> bind es
+    Nil1 pos -> Nil2 <$> getPosition pos
+    Nil2 pos -> Nil2 <$> getPosition pos
+    Record pos fields -> Record <$> getPosition pos <*> bind fields
+    Variable pos path -> do
+      scope <- getScope
+      pos' <- getPosition pos
+      modpath <- getModuleName
+      case (map stripPosition path, scope ^. hasNameContext) of
+        ([i], CtxDeclaration) -> do
+          let p = map (IUppercase npos) modpath ++ [i]
+          (ver, _) <- getVersion p
+          let ver' = ver + 1
+          writeVersion p (ver', False)
+          return
+            $ VCanonical pos'
+            $ CanonicalName (scope ^. hasTag) modpath i ver' []
+        ([i], c)
+          | c == CtxGlobal || c == CtxLocal -> do
+            {- HLINT ignore "Use let" -}
+            p <-
+              return
+                $ case c of
+                    CtxGlobal -> map (IUppercase npos) modpath ++ [i]
+                    CtxLocal -> [IUppercase npos identLocal, i]
+                    _ -> undefined
+            (ver, isBound) <- getVersion p
+            let ver' =
+                  if c == CtxGlobal && not isBound
+                    then ver
+                    else ver + 1
+            writeVersion p (ver', True)
+            return
+              $ VCanonical pos'
+              $ CanonicalName
+                  (scope ^. hasTag)
+                  (if c == CtxLocal
+                     then [identLocal]
+                     else modpath)
+                  i
+                  ver'
+                  []
+        (_, CtxUsage) -> do
+          case splitPath (map stripPosition path) [] of
+            -- Path without module
+            [x:ridents]
+              | not (isUppercase x) && all isLowercase ridents ->
+                matchName pos' [] x
+                  $ map
+                      (\case
+                         ILowercase _ i -> i
+                         _ -> undefined)
+                      ridents
+            -- Constructor
+            [x]
+              | all isUppercase x ->
+                matchName
+                  pos'
+                  (map (\(IUppercase _ i) -> i) $ init x)
+                  (last x)
+                  []
+            -- Global variable inside a module...
+            [modpath', x:ridents] ->
+              matchName pos' (map (\(IUppercase _ i) -> i) modpath') x
+                $ map (\(ILowercase _ i) -> i) ridents
+            _ -> bad pos' $ "Invalid variable name " ++ show path
+        _ -> bad pos' $ "Invalid name, got " ++ printTree path
+  -- EOp1
+    EPrefix pos op e1 -> do
+      pos' <- getPosition pos
+      op' <- bind $ Variable npos [IPrefix npos op]
+      e1' <- bind e1
+      return $ EApply pos' op' [e1']
+    ENegateInt pos e1 -> do
+      pos' <- getPosition pos
+      op' <- bind $ Variable npos [IPrefix npos $ Prefix "~-"]
+      e1' <- bind e1
+      return $ EApply pos' op' [e1']
+  -- EOp2
+    EAdd pos e1 op e2 -> bindOp2 pos (OpAdd npos op) e1 e2
+    EAt pos e1 op e2 -> bindOp2 pos (OpAt npos op) e1 e2
+    EAnd pos e1 op e2 -> bindOp2 pos (OpAnd npos op) e1 e2
+    EAppend pos e1 e2 -> EAppend <$> getPosition pos <*> bind e1 <*> bind e2
+    EAssign pos e1 e2 -> EAssign <$> getPosition pos <*> bind e1 <*> bind e2
+    EAssignRef pos e1 op e2 -> bindOp2 pos (OpAssignRef npos op) e1 e2
+    ECompare pos e1 op e2 -> bindOp2 pos (OpCompare npos op) e1 e2
+    EHash pos e1 op e2 -> bindOp2 pos (OpHash npos op) e1 e2
+    EMultiply pos e1 op e2 -> bindOp2 pos (OpMul npos op) e1 e2
+    EOr pos e1 op e2 -> bindOp2 pos (OpOr npos op) e1 e2
+    EShift pos e1 op e2 -> bindOp2 pos (OpShift npos op) e1 e2
+    ESubFloat pos e1 e2 -> bindOp2 pos (OpSubFloat npos) e1 e2
+    ESubInt pos e1 e2 -> bindOp2 pos (OpSubInt npos) e1 e2
+    LetPattern pos e1 e2 ->
+      bindOp2 pos (OpCompare npos $ InfixCompare "=") e1 e2
+    TTuple pos e1 es -> bindMultiplication pos (e1 : es)
+    other -> do
+      pos' <- getPosition (hasPosition other)
+      bad pos' $ "Cannot bind invalid expression " ++ show other
 
-fvFromJust :: Maybe a -> AResult a
-fvFromJust x = case x of
-  Just t -> return t
-  Nothing -> bad "Error"
-
-instance StaticBinding SimpleVariable where
-  fvBind x = case x of
-    VVariable names -> do
-      scope <- askE
-      VCanonical <$> if scope^.isnext
-        then fvCanonicalize names >>= fvNext
-        else fvAlternative [
-          -- Check if it is module docs.
-          fvCanonicalize names >>= fvLastModuleDocs >>= fvFromJust,
-          -- Check locally.
-          local setLocal (fvCanonicalize names >>= fvLast >>= fvFromJust),
-          -- Check current module, when in module.
-          local setGlobal (fvCanonicalize names >>= fvLast >>= fvFromJust), 
-          -- Check globally.
-          local (setGlobal . resetModuleName) (fvCanonicalize names >>= fvLast >>= fvFromJust),
-          -- Print error..
-          bad $ "fvLast: Variable not found " ++ show x
-          ]
-    VBlank -> bad "Blank is not convertible."
-    VCanonical name -> bad "Double binding is not permitted."
-
-instance StaticBinding Variable where
-  fvBind x = case x of
-    VSimple simplevariable -> case simplevariable of
-      VVariable name -> do
-        scope <- askE
-        b <- isConstructor name
-        if b
-          then return . VConstructor $ name
-          else do
-            p <- checkScopedVariable name
-            VSimple <$> case p of
-              Just _ -> local setLocal (fvBind simplevariable)
-              Nothing -> fvBind simplevariable
-      _ -> return x
-    VOpTuple tupleconstr -> return x
-    VOp op -> fvBindOp $ printTree op
-
--- Buggy grammar ... This should not exist...
-fvFixGrammar :: Expression -> AResult Expression
-fvFixGrammar x = case x of
-  EFunctionCall name es -> case name of
-    VOpTuple T -> return $ ETuple es
-    VConstructor x -> do 
-      es' <- forM es fvFixGrammar
-      return $ ENamedTuple x es'
-  _ -> return x
-
-instance StaticBinding Matching where
-  fvBind x = case x of
-    Matching1 patterns expression -> do
-      ps <- local (setLocal . setNext) (forM patterns fvBind)
-      ps' <- forM ps fvFixGrammar
-      e <- local (compose $ map fvPushMatching ps') (fvBind expression)
-      return $ Matching1 ps' e
-
-instance StaticBinding Definition where
-  fvBind x = case x of
-    SValue letrec (name:params) expr -> case letrec of
-      RecNo -> do
-        params' <- local (setLocal . setNext) (fvBind params)
-        expr' <- local (fvInsertN params') (fvBind expr)
-        name' <- local setNext (fvBind name)
-        return $ SValue letrec (name':params') expr'
-      RecYes -> do
-        name' <- local setNext (fvBind name)
-        params' <- local (setLocal . setNext) (fvBind params)
-        let names' = name':params'
-        expr' <- local (fvInsertN names') (fvBind expr)
-        return $ SValue letrec names' expr'
-    SExternal variable type_ binding -> do
-      v' <- local setNext (fvBind variable)
-      return $ SExternal v' type_ binding
-
-instance StaticBinding ModuleContent where
-  fvBind x = case x of
-    SDefinition valuedefinition -> do
-      vd <- fvBind valuedefinition
-      return $ SDefinition vd
-    _ -> return x
-
-instance StaticBinding ModuleName where
-  fvBind x = case x of
-    SModuleName0 name -> SModuleName0 <$> fvNextModule name
-    SModuleName1 name signame -> do
-      name' <- fvNextModule name
-      msigname <- fvLastModule signame
-      case msigname of
-        Just signame' -> do
-          context <- get
-          if Map.member signame' (context ^. hmodules . signatures)
-            then do
-              modify $ over (hmodules . implements) (Map.insert name' signame')
-              return $ SModuleName1 name' signame'
-            else bad $ "Expected a valid module signature. Got '" ++ printTree x ++ "'."
-        _ -> 
-          bad $ "Signature with name '" ++ printTree signame ++ "' does not exist."
+instance StaticBinding Expr where
+  bind x = do
+    scope <- getScope
+    case scope ^. hasTag of
+      TagType -> bindType x
+      TagPattern -> bindPattern x
+      _ -> bindExpression x
 
 instance StaticBinding Statement where
-  fvBind x = case x of
-    SDirective _ -> return x
-    SEnable _ -> return x
-    SExpression e -> SExpression <$> fvBind e
-    SExpressionWithType e t -> SExpressionWithType <$> fvBind e <*> fvBind t
-    SSignature _ -> return x
-    STypedef type_ definition -> do
-      definition' <- case definition of
-        TypedefConstructors constructors -> return definition
-        TypedefRecords fields -> do
-          fields' <- forM fields $ \(TRecordField m i t) -> 
-            return $ TRecordField m i (typeFlatten t)
-          return $ TypedefRecords fields'
-      return $ STypedef (typeFlatten type_) definition'
-    SModuleContent c -> SModuleContent <$> fvBind c
-    SModuleSignature name sigs -> do
-      name' <- fvNextModule name
-      return $ SModuleSignature name' sigs
-    SModuleDefinition smodule modulecontents -> do
-      smodule' <- fvBind smodule
-      let name = smodule' ^. lensNameFromModuleName
-      contents <- local (setNoOutput . setModuleName name) $ forM modulecontents fvBind
-      return $ SModuleDefinition smodule' contents
+  bind x =
+    case x of
+      Definition pos rec@(RecYes _) defs -> do
+        pos' <- getPosition pos
+        defs' <-
+          mapM
+            (\case
+               LetPattern _ p e -> do
+                 p' <- local (setNameContext CtxGlobal) (bind p)
+                 case p' of
+                   ETyped _ (EApply _ _ params) _ -> do
+                     e' <- dummyPrepare params (bind e)
+                     return $ LetPattern npos p' e'
+                   EApply _ _ params -> do
+                     e' <- dummyPrepare params (bind e)
+                     return $ LetPattern npos p' e'
+                   _ -> LetPattern npos p' <$> bind e
+               other -> do
+                 pos2' <- getPosition (hasPosition other)
+                 bad pos2' $ "Invalid definition, got... " ++ printTree other)
+            defs
+        return $ Definition pos' rec defs'
+      Definition pos rec@(RecNo _) defs -> do
+        pos' <- getPosition pos
+        defs' <-
+          mapM
+            (\case
+               LetPattern _ (ETyped _ (EApply _ v params) t) e -> do
+                 params' <- local (setNameContext CtxLocal) (bind params)
+                 e' <- dummyPrepare params' (bind e)
+                 v' <- local (setNameContext CtxGlobal) (bind v)
+                 t' <- local (setTag TagType) (bind t)
+                 return
+                   $ LetPattern
+                       npos
+                       (ETyped npos (EApply npos v' params') t')
+                       e'
+               LetPattern _ (EApply _ v params) e -> do
+                 params' <- local (setNameContext CtxLocal) (bind params)
+                 e' <- dummyPrepare params' (bind e)
+                 v' <- local (setNameContext CtxGlobal) (bind v)
+                 return $ LetPattern npos (EApply npos v' params') e'
+               LetPattern _ v e -> do
+                 e' <- bind e
+                 v' <- local (setNameContext CtxGlobal) (bind v)
+                 return $ LetPattern npos v' e'
+               other -> do
+                 pos2' <- getPosition (hasPosition other)
+                 bad pos2' $ "Invalid definition, got... " ++ printTree other)
+            defs
+        return $ Definition pos' rec defs'
+      Directive1 pos i v ->
+        Directive2
+          <$> getPosition pos
+          <*> return (DirectiveIdent $ "#" ++ printTree i)
+          <*> return v
+      Directive2 pos i v ->
+        Directive2 <$> getPosition pos <*> return i <*> return v
+      EndStmt _ stmt -> do
+        stmt' <- bind stmt
+        return $ EndStmt (hasPosition stmt') stmt'
+      Exception pos (ConstrOf _ v@(Variable _ [IUppercase {}]) t) -> do
+        pos' <- getPosition pos
+        v' <- local (setNameContext CtxGlobal) (bind v)
+        t' <- local (setTag TagType) (bind t)
+        return $ Exception pos' (ConstrOf npos v' t')
+      Expression _ e -> Expression <$> getPosition (hasPosition e) <*> bind e
+      External pos (LetPattern _ (ETyped _ v t) (EConstant _ (CString _ binding))) -> do
+        pos' <- getPosition pos
+        v' <- local (setNameContext CtxGlobal) (bind v)
+        t' <- local (setTag TagType) (bind t)
+        let count = countParameters t'
+        params <-
+          forM (toParameters count) $ \p ->
+            local (setNameContext CtxLocal) (bind p)
+        let expr = toLambda params $ EExternalLambda binding t' params
+        return $ External pos' (LetPattern npos (ETyped npos v' t') expr)
+      Module pos p -> Module <$> getPosition pos <*> return p
+      ModuleType pos p -> ModuleType <$> getPosition pos <*> return p
+      Signature pos (ETyped _ v@(Variable _ [ILowercase {}]) t) -> do
+        pos' <- getPosition pos
+        v' <- local (setNameContext CtxDeclaration) (bind v)
+        t' <- local (setTag TagType) (bind t)
+        return . Signature pos' $ ETyped npos v' t'
+      SLetIn pos rec es e -> do
+        ELetIn pos' rec' es' e' <- bind (ELetIn pos rec es e)
+        return $ SLetIn pos' rec' es' e'
+      Typedef pos t p es -> do
+        pos' <- getPosition pos
+        t' <- local (setTag TagType . setNameContext CtxGlobal) (bind t)
+        es' <-
+          mapM
+            (\case
+               v@Variable {} -> local (setNameContext CtxGlobal) (bind v)
+               ConstrOf pos2 v@(Variable _ [IUppercase _ _]) type_ -> do
+                 v' <- local (setNameContext CtxGlobal) (bind v)
+                 type_' <- local (setTag TagType) (bind type_)
+                 return $ ConstrOf pos2 v' type_'
+               Record pos2 fields ->
+                 local (setNameContext CtxGlobal) (Record pos2 <$> bind fields)
+               other -> local (setTag TagType) (bind other))
+            es
+        return $ Typedef pos' t' p es'
+      _ -> bad Nothing $ "Cannot bind statement " ++ show x
 
--- TODO merge Definition with ModuleContent
-
-toLabeledStatementFromDefinition :: Definition -> AResult LabeledStatement
-toLabeledStatementFromDefinition x = case x of
-  SValue _ (name:params) expression -> do
-    mparams <- local setLocal (forM params $ return . EVar)
-    return $ SLabeled name $ toLambda mparams expression
-  SExternal variable type_ binding -> do
-    let count = typeCountParameters $ typeFlatten type_
-    params <- forM (toParameters count) $ \p -> local (setLocal . setNext) (fvBind p)
-    let expr = toLambda params $ EExternalFunctionCall binding params
-    return $ SLabeled variable expr
-      where
-        typeCountParameters :: Type -> Int -- [TODO] This is not ideal ....
-        typeCountParameters x = case x of
-          TFunction x1 x2 -> 1 + typeCountParameters x2 
-          _ -> 0
-
-toLabeledStatementFromModuleContent :: ModuleContent -> AResult LabeledStatement
-toLabeledStatementFromModuleContent x = case x of
-  SExceptionDefinition (NException (Ident ename)) type_ -> do
-    name <- VSimple . VCanonical <$> (fvCanonicalize [Ident ename] >>= fvNext) -- ?
-    let expr = EString ename
-    return $ SLabeled name expr -- [TODO] WTF? Type checking for exceptions ...
-
-  SDefinition lvd -> toLabeledStatementFromDefinition lvd
+instance StaticBinding Toplevel where
+  bind x =
+    case x of
+      Toplevel1 pos s -> Toplevel1 <$> getPosition pos <*> mapM bind s
+      Toplevel2 pos e s ->
+        Toplevel1 <$> getPosition pos <*> mapM bind (Expression pos e : s)

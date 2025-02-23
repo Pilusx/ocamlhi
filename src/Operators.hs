@@ -1,164 +1,75 @@
---
--- Operator interpretation algorithm.
--- It describes what 'op1 x' or '(x op2 y)' really means.
--- Ocaml uses C bindings to simulate some of the functions.
--- To make it easier this file provides implementation of those functions written in Haskell. 
---
-
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
-module Operators (
-  applyBoolInfixOp,
-  applyInfixOp,
-  applyPrefixOp
-  ) where
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE MonoLocalBinds #-}
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE QuantifiedConstraints #-}
+{-# LANGUAGE UndecidableInstances #-}
+{-# OPTIONS_GHC -Wno-orphans #-}
 
-import Control.Monad.Catch (catchAll)
-import Data.Bits (xor, (.&.), (.|.))
-import Data.Fixed (mod')
+module Operators where
 
-import Context
 import Grammar
-import PrintOcaml
 
-toBool :: Boolean -> Bool
-toBool ETrue = True
-toBool EFalse = False
+instance Iso Constant Bool where
+  from True = CTrue npos
+  from False = CFalse npos
+  to =
+    \case
+      CTrue _ -> True
+      CFalse _ -> False
+      _ -> undefined
 
-fromBool :: Bool -> Boolean
-fromBool True = ETrue
-fromBool False = EFalse
+instance Iso Constant Char where
+  to =
+    \case
+      CChar _ c -> c
+      _ -> undefined
+  from = CChar npos
 
-class Parameter a where
-  apply1 :: String -> a -> a
-  apply1 = undefined 
-  apply2 :: String -> a -> a -> a
-  apply2 = undefined
-  apply2b :: String -> a -> a -> Bool
-  apply2b = undefined
+instance Iso Constant Double where
+  to =
+    \case
+      CDouble _ d -> d
+      _ -> undefined
+  from = CDouble npos
 
-instance Parameter Bool where
-  apply1 x = case x of
-    "not" -> not
-    "-" -> undefined
-  apply2b x = case x of
-    "==" -> (==)
-    "/=" -> (/=)
-    "<>" -> (/=)
-    "<" -> (<)
-    "<=" -> (<=)
-    ">" -> (>)
-    ">=" -> (>=)
-    "or" -> (.|.)
-    "xor" -> xor
-    "and" -> (.&.)
+instance Iso Constant Integer where
+  to =
+    \case
+      CInteger _ i -> i
+      _ -> undefined
+  from = CInteger npos
 
-instance Parameter Integer where
-  apply1 x v = case x of
-    "not" -> undefined
-    "-" -> -v
+instance Iso Constant String where
+  to =
+    \case
+      CString _ c -> c
+      _ -> undefined
+  from = CString npos
 
-  apply2 op = case op of
-    "+" -> (+)
-    "-" -> (-)
-    "*" -> (*)
-    "mod" -> mod
-    "/" -> div
-    _ -> error "Unknown operator"
-  
-  apply2b op = case op of
-    "==" -> (==)
-    "/=" -> (/=)
-    "<>" -> (/=)
-    "<" -> (<)
-    "<=" -> (<=)
-    ">" -> (>)
-    ">=" -> (>=)
-    "or" -> \x y -> (.|.) x y /= 0
-    "xor" -> \x y -> xor x y /= 0
-    "and" -> \x y ->  (x /= 0) && (y /= 0)
+instance Iso Constant a => Iso Expr a where
+  to =
+    \case
+      EConstant _ c -> (to :: Constant -> a) c
+      _ -> undefined
+  from = EConstant npos . (from :: a -> Constant)
 
-instance Parameter String where
-  apply2b op = case op of
-    "==" -> (==)
-    "/=" -> (/=)
-    "<>" -> (/=)
-    "<" -> (<)
-    "<=" -> (<=)
-    ">" -> (>)
-    ">=" -> (>=)
-    _ -> error "Unknown operator"
+class Iso Expr a =>
+      MyApplicative a
+  where
+  apply1 :: (a -> a) -> Expr -> Expr
+  apply1 f = from . f . to
+  apply2 :: (a -> a -> a) -> Expr -> Expr -> Expr
+  apply2 f x1 x2 = from $ f (to x1) (to x2)
 
-instance Parameter Double where
-  apply2b op = case op of
-    "==" -> (==)
-    "/=" -> (/=)
-    "<>" -> (/=)
-    "<" -> (<)
-    "<=" -> (<=)
-    ">" -> (>)
-    ">=" -> (>=)
-    _ -> error "Unknown operator"
+instance MyApplicative Bool
 
-  apply1 x v = case x of
-    "not" -> undefined
-    "-" -> -v
-  
-  apply2 op = case op of
-    "+" -> (+)
-    "-" -> (-)
-    "*" -> (*)
-    "mod" -> mod'
-    "/" -> (/)
-    _ -> error "Unknown operator"
+instance MyApplicative Char
 
-instance Parameter Boolean where
-  apply1 f x = fromBool $ apply1 f (toBool x)
-  apply2 f x y = fromBool $ apply2 f (toBool x) (toBool y)
-  apply2b f x y = apply2b f (toBool x) (toBool y)
+instance MyApplicative Double
 
-instance Parameter Constant where
-  apply1 f (EBool x) = EBool $ apply1 f x
-  apply1 f (EInt x) = EInt $ apply1 f x
-  apply1 f (EFloat x) = EFloat $ apply1 f x
+instance MyApplicative Integer
 
-  apply2 f (EBool x) (EBool y) = EBool $ apply2 f x y
-  apply2 f (EInt x) (EInt y) = EInt $ apply2 f x y
-  apply2 f (EFloat x) (EFloat y) = EFloat $ apply2 f x y
-
-  apply2b f (EBool x) (EBool y) = apply2b f x y
-  apply2b f (EInt x) (EInt y) = apply2b f x y
-  apply2b f (EFloat x) (EFloat y) = apply2b f x y
-
-instance Parameter Expression where
-  apply1 f (EConst x) = EConst $ apply1 f x
-  apply2 f (EConst x) (EConst y) = EConst $ apply2 f x y
-
-  apply2b f (EConst x) (EConst y) = apply2b f x y
-  apply2b f (EString x) (EString y) = apply2b f x y
-  
-  -- Operator (==) for tuples
-  apply2b "==" x y = case (x, y) of 
-    (EVar (VConstructor [x]), EVar (VConstructor [y])) -> 
-      x == y
-    (ETuple xs, ETuple ys) -> 
-      length xs == length ys && and (zipWith (apply2b "==") xs ys)
-    (ENamedTuple xname xs, ENamedTuple yname ys) ->
-      xname == yname && apply2b "==" (ETuple xs) (ETuple ys)
-
--- Exposed functions.
-
-applyBoolInfixOp :: String -> Expression -> Expression -> AResult Expression
-applyBoolInfixOp f x y = do
-  r <- catchAll (return $ apply2b f x y) $
-    appendSomeTrace (EROperator (printTree f) [x, y])
-  return . EConst . EBool . fromBool $ r
-
-applyInfixOp :: String -> Expression -> Expression -> AResult Expression
-applyInfixOp f x y =
-  catchAll (return $ apply2 f x y) $
-    appendSomeTrace (EROperator (printTree f) [x, y])
-
-applyPrefixOp :: String -> Expression -> AResult Expression
-applyPrefixOp f x = 
-  catchAll (return $ apply1 f x) $ 
-    appendSomeTrace (EROperator (printTree f) [x])
+instance MyApplicative String

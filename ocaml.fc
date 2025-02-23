@@ -1,180 +1,197 @@
--- TODO rewrite comments to (* *)
-comment "--";
+-- This file is based on:
+-- * https://ocaml.org/manual/lex.html
+-- * https://ocaml.org/manual/toplevel.html
+-- * https://ocaml.org/manual/intfc.html
+-- The OCaml language 4.12
+
 comment "(*" "*)";
-entrypoints Prog;
+entrypoints Toplevel;
 
--- Main
+-- 3. Names
+OpOr.        Infix ::= InfixOr;
+OpAnd.       Infix ::= InfixAnd;
+OpCompare.   Infix ::= InfixCompare;
+OpAt.        Infix ::= InfixAt;
+OpAppend.    Infix ::= "::";
+OpAdd.       Infix ::= InfixAdd;
+OpSubInt.    Infix ::= "-";
+OpSubFloat.  Infix ::= "-.";
+OpMul.       Infix ::= InfixMultiply;
+OpMulInt.    Infix ::= "*";
+OpShift.     Infix ::= InfixShift;
+OpHash.      Infix ::= InfixHash;
+OpAssignRef. Infix ::= InfixAssignRef;
 
-Prog1. Prog ::= [Statement] ;
+-- 5. Constants
+CInteger.    Constant ::= Integer;
+CDouble.     Constant ::= Double;
+CChar.       Constant ::= Char;
+CString.     Constant ::= String;
+CFalse.      Constant ::= "false";
+CTrue.       Constant ::= "true";
+CUnit1.      Constant ::= "()";
+CUnit2.      Constant ::= "(" ")";
+CBegin.      Constant ::= "begin" "end";
+internal CConstructor. Constant ::= [OIdent];
+internal CFun. Constant ::= "<fun>";
 
-separator Statement ";;" ;
-SDirective. Statement ::= "#" "use" FileName;
-SEnable. Statement ::= "#" "enable" String;
-SExpression. Statement ::= Expression;
-SExpressionWithType. Statement ::= Expression "::" Type; -- FIXME?
-SSignature. Statement ::= Signature;
-TypedefConstructors. TypedefDefinition ::= [Constructor] ;
-TypedefRecords. TypedefDefinition ::= "{" [RecordField] "}";
-STypedef. Statement ::= "type" Type "=" TypedefDefinition;
-SModuleContent. Statement ::= ModuleContent;
+-- 7. Expressions
 
-EConst. Expression ::= Constant;
-EString. Expression ::= String;
-EVar. Expression ::= Variable;
-EOp1. Expression ::= PrefixOp Expression;
-EOp2. Expression ::= "(" Expression InfixOp Expression ")";
-ERecord. Expression ::= "{" [LabeledStatement] "}";
-EIfThenElse. Expression ::= "if" Expression "then" "{" Expression "}" "else" "{" Expression "}";
-EMatch. Expression ::= "match" [SimpleVariable] "with" "(" [Matching] ")" ;
+ForTo.             ForToDownTo ::= "to";
+ForDownTo.         ForToDownTo ::= "downto";
 
--- This enables type checking.
--- `a -> String
-ETypeOf. Expression ::= "__typeof__" Expression ;
+RecNo.             RecOptional ::=;
+RecYes.            RecOptional ::= "rec";
 
--- Let binding
-RecNo. RecursivePrefix ::= ;
-RecYes. RecursivePrefix ::= "rec";
+coercions Expr 24;
 
-SValue. Definition ::= "let" RecursivePrefix [Variable] "=" Expression;
-SExternal. Definition ::= "external" Variable ":" Type "=" String;
-ELocalDefinition. Expression ::= Definition "in" Expression; -- external should not be allowed..
+separator Field ";";
+EField.            Field ::= Expr23 "=" Expr2;
+EFieldDecl.        Field ::= Expr23 ":" Expr4;
+EFieldDeclMut.     Field ::= "mutable" Expr23 ":" Expr4;
 
--- Imperative statements
-separator nonempty SequencingExpression ";";
-ESeq. SequencingExpression ::= Expression;
-EAssign. SequencingExpression ::= Variable "<-" Expression;
-EStack. Expression ::= "begin" [SequencingExpression] "end";
-ForTo. ForIterationType ::= "to";
-ForDownto. ForIterationType ::= "downto";
-EFor. Expression ::= "for" Variable "=" Expression ForIterationType Expression "do" [SequencingExpression] "done";
-EWhile. Expression ::= "while" Expression "do" [SequencingExpression] "done" ;
+Variable.          Expr23 ::= [OIdent];
+TIdent.            Expr23 ::= "'" OIdent;
+Blank.             Expr23 ::= "_";
+EConstant.         Expr23 ::= Constant;
+Record.            Expr23 ::= "{" [Field] "}";
+List.              Expr23 ::= "[" [Expr2] "]";
+Nil1.              Expr23 ::= "[" "]";
+Nil2.              Expr23 ::= "[]";
 
--- Expressions
+EBegin.            Expr22 ::= "begin" Expr "end";
+EWhile.            Expr22 ::= "while" Expr "do" Expr "done";
+EFor.              Expr22 ::= "for" Expr ForToDownTo Expr "do" Expr "done";
 
-separator Expression ",";
-separator LabeledStatement ";";
-SLabeled. LabeledStatement ::= Variable "=" Expression;
-SLabeledTyped. LabeledStatement ::= Variable "of" Type "=" Expression ;
+EPrefix.           Expr21 ::= Prefix Expr21;
 
--- Function calls
-EFunctionCall. Expression ::= Variable "(" [Expression] ")";
-ERecursiveFunctionCall. Expression ::= Variable "rec" "(" [Expression] ";" Expression ")";
-FunctionPrefix1. FunctionPrefix ::= "function";
-FunctionPrefix2. FunctionPrefix ::= "fun"; -- anonymous functions
-ELambda. Expression ::= FunctionPrefix Matching ;
+EHash.             Expr19 ::= Expr19 InfixHash Expr20;
 
--- Exceptions
-NException. ExceptionName ::= Ident ;
-SExceptionDefinition. ModuleContent ::=  "exception" ExceptionName "of" Type;
-ERaise. Expression ::= "raise" "(" ExceptionName Expression ")" ;
+separator nonempty Expr18 " ";
+EApply.            Expr17 ::= Expr18 [Expr18];
+internal EConstructor. Expr17 ::= Expr23 Expr18;
+internal TPolymorphic. Expr17 ::= Expr17 Expr23;
 
--- Types
-separator nonempty Constructor "|";
-ConstructorEps. Constructor ::= Ident;
-ConstructorType. Constructor ::= Ident "of" Type;
+ENegateInt.        Expr16 ::= "-" Expr17;
+ENegateFloat.      Expr16 ::= "-." Expr17;
 
-TBool. TypeConst ::= "bool";
-TInt. TypeConst ::= "int";
-TChar. TypeConst ::= "char";
-TFloat. TypeConst ::= "float";
-TString. TypeConst ::= "string";
-TUnit. TypeConst ::= "unit";
+separator nonempty Expr15 "*";
+EShift.            Expr15 ::= Expr16 InfixShift Expr15;
 
-TConstr. TypeConstr ::= Ident ;
+EMultiply.         Expr14 ::= Expr14 InfixMultiply Expr15;
+TTuple.            Expr14 ::= Expr15 "*" [Expr15];
 
-T1Const. Type2 ::= TypeConst;
-TIdent. Type2 ::= "`" Ident;
-TAlias. Type2 ::= TypeConstr;
+EAdd.              Expr13 ::= Expr13 InfixAdd Expr14;
+ESubInt.           Expr13 ::= Expr13 "-" Expr14;
+ESubFloat.         Expr13 ::= Expr13 "-." Expr14; 
 
--- List with at least 2 parameters.
-TParameters2. TypeParameters ::= Type "," Type;
-TParametersN. TypeParameters ::= Type "," TypeParameters;
-TParameterized1. Type2 ::= Type2 TypeConstr;
-TParameterizedN. Type2 ::= "(" TypeParameters ")" TypeConstr;
+EAppend.           Expr12 ::= Expr13 "::" Expr12;
 
--- Hacky coercion Type 2;;
-_. Type2 ::= "(" Type ")";
-separator nonempty Type2 "*";
-TTuple. Type1 ::= [Type2];
-_. Type ::= Type1;
-TFunction. Type ::= Type1 "->" Type;
+EAt.               Expr11 ::= Expr12 InfixAt Expr11;
 
-separator nonempty Signature "";
-Signature1. Signature ::= "val" Variable "of" Type ;
+ECompare.          Expr10 ::= Expr10 InfixCompare Expr11;
 
--- Typedef record
-MutableNo. Mutable ::= ;
-MutableYes. Mutable ::= "mutable";
-separator nonempty RecordField ";";
-TRecordField. RecordField ::= Mutable Ident ":" Type;
+EAnd.              Expr9 ::= Expr10 InfixAnd Expr9;
 
--- Operators (very quirky...)
--- Original grammar: https://caml.inria.fr/pub/docs/manual-ocaml/lex.html#infix-symbol
+EOr.               Expr8 ::= Expr9 InfixOr Expr8;
 
--- core-operator-char ::= ["$|&*+-/=>@^|"]
--- operator-char ::= ( ["~!?%<:."] | core-operator-char)
-token InfixSymbol (
--- ( core-operator-char |  % |  < ) { operator-char }
-  ((["$&*+-/=>@^|%<"]) (["~!?%<:.$&*+-/=>@^|"]*))
---  # { operator-char }+
-| ('#' (["~!?%<:.$&*+-/=>@^|"]+))
-);
-token PrefixSymbol (
+separator nonempty Expr8 ",";
+ETuple.            Expr7 ::= Expr8 "," [Expr8];
+internal TParams.  Expr7 ::= [Expr8];
+
+EAssignRef.        Expr6 ::= Expr7 InfixAssignRef Expr6;
+EAssign.           Expr6 ::= Expr7 "<-" Expr6;
+
+EIf.               Expr5 ::= "if" Expr6 "then" Expr6;
+EIfElse.           Expr5 ::= "if" Expr6 "then" Expr6 "else" Expr5;
+
+TFunction.         Expr4 ::= Expr5 "->" Expr4;
+
+ConstrOf.          Expr3 ::= Expr23 "of" Expr4;
+ETyped.            Expr3 ::= Expr17 ":" Expr4;
+
+separator nonempty Expr3 "|";
+ConstrOr.          Expr2 ::= Expr3 "|" [Expr3];
+
+separator nonempty Expr2 ";";
+ESeq.              Expr1 ::= Expr2 ";" [Expr2];
+ModuleSignature.   Expr1 ::= "sig" Toplevel "end";
+ModuleDefinition.  Expr1 ::= "struct" Toplevel "end";
+
+separator nonempty Expr1 "and";
+Fun1.              Function ::= "fun";
+Fun2.              Function ::= "function";
+ELambda.           Expr1 ::= Function [Expr18] "->" Expr;
+ELambdaTyped.      Expr1 ::= Function [Expr18] ":" Expr5 "->" Expr;
+
+PatternPrefixNo.   PatternPrefixOptional ::=;
+PatternPrefixYes.  PatternPrefixOptional ::= "|";
+
+LetPattern.        Expr1 ::= Expr2 "=" Expr;
+EMatch.            Expr1 ::= "match" Expr "with" PatternPrefixOptional [Expr3];
+ETryWith.          Expr1 ::= "try" Expr "with" PatternPrefixOptional [Expr3];
+
+ELetIn.            Expr ::= "let" RecOptional [Expr1] "in" Expr;
+
+-- Chapter 10 The toplevel system or REPL (ocaml)
+
+separator Statement "";
+Signature.    Statement ::= "val" Expr3;
+External.     Statement ::= "external" Expr1;
+Typedef.      Statement ::= "type" Expr4 "=" PatternPrefixOptional [Expr3];
+Exception.    Statement ::= "exception" Expr3;
+Module.       Statement ::= "module" Expr1;
+ModuleType.   Statement ::= "module" "type" Expr1;
+Definition.   Statement ::= "let" RecOptional [Expr1];
+SLetIn.       Statement ::= "let" RecOptional [Expr1] "in" Expr;
+Expression.   Statement ::= ";;" Expr1;
+Directive1.   Statement ::= "#" OIdent Expr17;
+Directive2.   Statement ::= DirectiveIdent Expr17;
+EndStmt.      Statement ::= Statement ";;";
+
+Toplevel1.    Toplevel ::= [Statement];
+Toplevel2.    Toplevel ::= Expr1 [Statement];
+
+-- 1. Lexical conventions.
+-- Identifiers should have lower priorities from tokens (lsl / land etc.)
+-- That's why it is the last set of rules.
+
+token Prefix (
 -- ! { operator-char }
   ('!' (["~!?%<:.$&*+-/=>@^|"]*))
 -- (? |  ~) { operator-char }+
 | (["?~"] (["~!?%<:.$&*+-/=>@^|"]+))
 );
-
-token InfixSymbolOther (
-  '+' | '=' | '&' | {"-."} | {"!="} | {"<>"} | {"||"} | {"&&"} | {":="}
-| {"or"} | {"mod"} | {"land"} | {"lor"} | {"lxor"} | {"lsl"} | {"lsr"} | {"asr"}
+token InfixHash ('#' (["~!?%<:.$&*+-/=>@^|"]+));
+token InfixShift ({"lsl"} | {"lsr"} | {"asr"});
+token InfixMultiply (
+  ((["*/%"]) (["~!?%<:.$&*+-/=>@^|"]*)) |
+  {"mod"} | {"land"} | {"lor"} | {"lxor"}
 );
-token PrefixSymbolOther ('-' | {"-."});
+token InfixAdd ((["+-"]) (["~!?%<:.$&*+-/=>@^|"]*));
+token InfixAt ((["@^"]) (["~!?%<:.$&*+-/=>@^|"]*));
+token InfixCompare (((["=<>|&$"]) (["~!?%<:.$&*+-/=>@^|"]*)) | {"!="});
+token InfixAnd ({"&"} | {"&&"});
+token InfixOr ({"or"} | {"||"});
+token InfixAssignRef ({":="});
 
-InfixOp1. InfixOp ::= InfixSymbol;
-InfixOp2. InfixOp ::= InfixSymbolOther;
--- Tokens do not work correctly for those cases, because they are keywords..
-InfixOpSub. InfixOp ::= "-";
-InfixOpMul. InfixOp ::= "*";
-InfixOpAssign. InfixOp ::= "<-";
-PrefixOp1. PrefixOp ::= PrefixSymbol;
-PrefixOp2. PrefixOp ::= PrefixSymbolOther;
-PrefixOpMinus. PrefixOp ::= "-";
-OpNamePrefix. OperatorName ::= PrefixSymbol;
-OpNameInfix. OperatorName ::= InfixOp;
 
--- Constants
-T. TupleConstr ::= "T";
-ETrue. Boolean ::= "true";
-EFalse. Boolean ::= "false";
-EBool. Constant ::= Boolean;
-EInt. Constant ::= Integer;
-EFloat. Constant ::= Double;
-EChar. Constant ::= Char;
+token DirectiveIdent ( '#' (letter | '_' )* );
+token UppercaseIdent ( upper ( letter | digit | '_' | '\'' )* );
+token LowercaseIdent ( (lower | '_') ( letter | digit | '_' | '\'' )* );
+separator nonempty OIdent ".";
+IUppercase.               OIdent ::= UppercaseIdent;
+ILowercase.               OIdent ::= LowercaseIdent;
+IPrefix.                  OIdent ::= "(" Prefix ")";
+IInfix.                   OIdent ::= "(" Infix ")";
+internal IVer.            OIdent ::= "v." Integer;
 
-separator Variable "";
-VSimple. Variable ::= SimpleVariable;
-VOpTuple. Variable ::= TupleConstr;
-VOp. Variable ::= "(" OperatorName ")";
+internal TagModule.       Tag ::= "<module>";
+internal TagType.         Tag ::= "<type>";
+internal TagExpression.   Tag ::= "<expression>";
+internal TagPattern.      Tag ::= "<pattern>";
 
-separator SimpleVariable ",";
-VVariable. SimpleVariable ::= [Ident];
-VBlank. SimpleVariable ::= "_" ;
-
--- Global variables
-separator nonempty Ident ".";
-
--- Modules
-NFile. FileName ::= String ;
-SModuleSignature. Statement ::= "module" "type" Ident "=" "sig" [Signature] "end";
-SModuleName0. ModuleName ::= "module" Ident;
-SModuleName1. ModuleName ::= "module" Ident ":" Ident;
-SModuleDefinition. Statement ::= ModuleName "=" "struct" [ModuleContent] "end" ;
-
-separator ModuleContent ";;";
-SDefinition. ModuleContent ::= Definition ;
-
--- Pattern matching
-Matching1. Matching ::= [Expression] "->" Expression ;
-separator nonempty Matching "|";
+internal CtxDeclaration.  NameContext ::= "<declaration>";
+internal CtxGlobal.       NameContext ::= "<global_definition>";
+internal CtxLocal.        NameContext ::= "<local_definition>";
+internal CtxUsage.        NameContext ::= "<usage>";

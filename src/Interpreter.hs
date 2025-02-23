@@ -2,358 +2,401 @@
 -- The 'meat' of the interpreter.
 -- It describes how the AST of the program should be interpreted.
 --
-
+{-# LANGUAGE BlockArguments #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE QuantifiedConstraints #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE UndecidableInstances #-}
 
-module Interpreter (
-  translate
+module Interpreter
+  ( prettyEval
   ) where
 
-import Control.Applicative (Alternative(..))
-import Control.Lens (over, (^.))
-import Control.Monad (when, forM, forM_, foldM, unless, msum)
-import Control.Monad.Except (throwError, catchError)
+import GHC.Float
+import GHC.Integer
+
+import Control.Lens ((^.), over)
+import Control.Monad (forM_)
+import Control.Monad.Except (catchError, throwError)
+import Control.Monad.Extra (firstJustM)
 import Control.Monad.Loops (iterateUntilM, whileM_)
-import Control.Monad.Reader (local)
-import Control.Monad.Trans.State (get, modify)
-import qualified Data.List as List
+import Control.Monad.Reader (lift, liftIO, local)
+import Control.Monad.Trans.State (modify)
+import Data.Functor ((<&>))
+import Data.IORef
+import Data.List (intercalate)
 import qualified Data.Map as Map
-import qualified Data.Set as Set
-import Data.Maybe (isNothing)
-import Debug.Trace (trace)
 
 import Context
-import ErrM (Err(..))
 import Flags
 import Grammar
 import Operators
-import PrintOcaml
+import PatternMatching
+import Print
 import StaticBinding
-import TypeConstraint (fromIntToTerm, OpenTerm)
 import Types
-import UtilsOcaml
 
--- Pattern matching
+applyExternal :: String -> [Expr] -> InterpreterT Expr
+applyExternal binding exprs = do
+  case exprs of
+    [e] ->
+      case binding of
+        "%raise" -> throwError $ ERException e
+        "%identity" -> return e
+        "%negint" -> return $ apply1 negateInteger e
+        "%boolnot" -> return $ apply1 not e
+        "%negfloat" -> return $ apply1 negateDouble e
+        "to_string" -> return (from $ printTree e :: Expr)
+        "type_of" -> undefined
+        "debug" -> return (from True :: Expr)
+        _ ->
+          bad Nothing
+            $ "Prefix function binding not available: " ++ show binding
+    [e1, e2] ->
+      case binding of
+        "%addint" -> return $ apply2 plusInteger e1 e2
+        "%subint" -> return $ apply2 minusInteger e1 e2
+        "%mulint" -> return $ apply2 timesInteger e1 e2
+        "%divint" ->
+          if (to e2 :: Integer) == 0
+            then throwError $ ERInternal "Divide by zero"
+            else return $ apply2 divInteger e1 e2
+        "%modint" -> return $ apply2 modInteger e1 e2
+        "%addfloat" -> return $ apply2 plusDouble e1 e2
+        "%subfloat" -> return $ apply2 minusDouble e1 e2
+        "%mulfloat" -> return $ apply2 timesDouble e1 e2
+        "%divfloat" -> return $ apply2 divideDouble e1 e2
+        "%lessthan" -> return . from $ e1 < e2
+        "%lessequal" -> return . from $ e1 <= e2
+        "%greaterthan" -> return . from $ e1 > e2
+        "%greaterequal" -> return . from $ e1 >= e2
+        "%eq" -> return . from $ e1 == e2
+        "%notequal" -> return . from $ e1 /= e2
+        _ ->
+          bad Nothing $ "Infix function binding not available: " ++ show binding
+    _ -> bad Nothing $ "Incorrect number of parameters to " ++ show binding
 
-instance Semigroup (Err [LabeledStatement]) where
-  (<>) (Bad s) _ = Bad s
-  (<>) _ (Bad s) = Bad s
-  (<>) (Ok m1) (Ok m2) = Ok (m1 <> m2)
+applyLambda :: Expr -> [Expr] -> InterpreterT Expr
+applyLambda x expressions =
+  case x of
+    ELambda _ _ ps e -> applyLambda (EPartial ps [] e) expressions
+    EPartial patterns parts e -> do
+      es' <- mapM eval expressions
+      let parts' = reverse es' ++ parts
+      case compare (length patterns) (length parts') of
+        GT -> return $ EPartial patterns parts' e
+        EQ ->
+          applyMatch
+            (List npos $ reverse parts')
+            [LetPattern npos (List npos patterns) e]
+        LT -> bad Nothing "You have passed to many arguments"
+    _ -> bad Nothing $ "Expected a lambda, got " ++ show x
 
-zipMatchings :: [Expression] -> [Expression] -> Err [LabeledStatement]
-zipMatchings vexprs pexprs = case compare (length vexprs) (length pexprs) of
-  EQ -> foldl (<>) (Ok []) $ zipWith pushMatching vexprs pexprs
-  LT -> Bad "(1) Partial application is not yet supported."
-  _ -> Bad "(2) Wrong tuple size."
+applyMatch :: Expr -> [Expr] -> InterpreterT Expr
+applyMatch expr patterns = do
+  mres <-
+    firstJustM
+      (\pattern' -> do
+         (p, e) <-
+           case pattern' of
+             LetPattern _ p e -> return (p, e)
+             ELambda _ _ [p] e -> return (p, e)
+             _ -> bad Nothing $ "Invalid pattern, got " ++ show pattern'
+         case match p expr of
+           Left err ->
+             if length patterns == 1
+               then bad Nothing err
+               else return Nothing
+           Right matches -> Just <$> prepare matches (eval e))
+      patterns
+  case mres of
+    Nothing -> throwError $ ERNoMatching expr patterns
+    Just e -> return e
 
-pushMatching :: Expression -> Expression -> Err [LabeledStatement]
-pushMatching ve pe = case (pe, ve) of 
-  (ETuple pexprs, ETuple vexprs) -> zipMatchings vexprs pexprs
-  (ENamedTuple pname pexprs, ENamedTuple vname vexprs) | pname == vname && not (null pexprs) -> 
-    zipMatchings vexprs pexprs
-  (EVar (VConstructor pname), EVar (VConstructor vname)) | pname == vname -> Ok []
-  (EVar (VSimple VBlank), _) -> Ok []
-  (EVar pv@(VSimple _),_) -> Ok [SLabeled pv ve]
-  (EConst _, EConst _) | pe == ve -> Ok []
-  (EConst _, EConst _) -> Bad "(3) Constants do not match."
-  _ -> Bad $ "(4) Invalid pattern matching.\n" ++ printTree pe ++ "\n" ++ printTree ve
+extractSignatures :: Toplevel -> InterpreterT [Statement]
+extractSignatures x =
+  case x of
+    Toplevel1 _ stmts ->
+      mapM
+        (\case
+           Signature pos (ETyped _ v t) -> do
+             pos' <- getPosition pos
+             t' <- local (setTag TagType) (bind t)
+             return $ Signature pos' (ETyped npos v t')
+           other ->
+             bad (hasPosition other)
+               $ "Invalid statement in typemodule. " ++ printTree other)
+        stmts
+    Toplevel2 {} ->
+      bad (hasPosition x) "Expressions are not allowed inside typemodule."
 
--- Function applications
-
-applyFunctionCall :: Expression -> [Expression] -> AResult Expression
-applyFunctionCall f expressions = case f of
-  EVar (VOpTuple T) -> eval $ ETuple expressions
-  EVar (VConstructor name) -> eval $ ENamedTuple name expressions
-  ELambda {} -> applyLambda f expressions
-  _ -> bad $ "Expression not callable.. " ++ printTree f
-
-applyFoldrFunctionCall :: Expression -> [Expression] -> Expression -> AResult Expression
-applyFoldrFunctionCall f expressions acc = case f of
-  ELambda {} -> foldM applyFunc acc (reverse expressions) where
-    applyFunc acc lhs = applyLambda f [lhs, acc]
-  EVar (VConstructor name) -> foldM applyFunc acc (reverse expressions) where
-    applyFunc acc lhs = return $ ENamedTuple name [lhs, acc] 
-  _ -> bad $ "Expected a lambda." ++ printTree f
-
--- TODO Make it less hacky....
--- acc (v, e) -> let temp = e in match temp with v -> acc
-applyPartialFunction :: Expression -> (Expression, Expression) -> AResult Expression
-applyPartialFunction acc (v, e) = do
-  temp <- local (setLocal . setNext) $ fvBind temporaryVariable
-  let match = EMatch [temp] [Matching1 [v] acc]
-  return $ ELocalDefinition (SValue RecNo [VSimple temp] e) match
-
--- TODO fix zero parameter calls?
-applyLambda :: Expression -> [Expression] -> AResult Expression
-applyLambda x expressions = case x of
-  ELambda ref matching@(Matching1 patterns expression) -> do
-    let len_expr = length expressions
-    let len_pat = length patterns
-    case compare len_expr len_pat of
-      LT -> do
-        let (ps1, ps2) = splitAt len_expr patterns
-        let ps1' = applyTuple ps1
-        let expressions' = applyTuple expressions
-        new_expression <- applyPartialFunction expression (ps1', expressions')
-        return $ toLambda ps2 new_expression
-      EQ -> do
-        es <- forM expressions eval
-        let e = applyTuple es
-        applyMatch e [matching]
-      GT -> bad $ "Too many parameters applied to function call. (" 
-        ++ show len_expr  ++ ">" ++ show len_pat ++ ")"
-  _ -> bad "Expected a lambda."
-
-applyMatch, applyMatchHelper :: Expression -> [Matching] -> AResult Expression
-applyMatch expr x =
-  applyMatchHelper expr x `catchError`
-    appendTrace (ERUnknown $ "match " ++ printTree expr ++ " with " ++ printTree x)
-
-applyMatchHelper e x = case x of
-  [] -> throwError $ ERNoMatching e
-  Matching1 patterns expression:ms -> do
-    let pe = applyTuple patterns
-    let result = pushMatching e pe
-    case result of
-      Bad s -> applyMatchHelper e ms
-      Ok lstmts -> withLocals lstmts $ eval expression 
-
-applyRecord :: [LabeledStatement] -> [Expression] -> Expression
-applyRecord labeledstatements expressions =
-  ERecord $ zipWith replaceLabeledStatement labeledstatements expressions
-
-applyTuple :: [Expression] -> Expression
-applyTuple = typeMerge ETuple
-
--- Evaluators
+loadSignature :: Path -> InterpreterT ()
+loadSignature sig = do
+  context <- getContext
+  let sigs = context ^. htypes . modulesignatures
+  case Map.lookup sig sigs of
+    Nothing ->
+      bad Nothing
+        $ intercalate "\n"
+        $ ["Cannot find signature " ++ printTree sig, "Available signatures:"]
+            ++ map printTree (Map.keys sigs)
+    Just stmts ->
+      forM_ stmts $ \case
+        Signature _ (ETyped _ v t) -> do
+          v' <- bind v
+          assertSignature v' t
+        _ -> undefined
 
 class Evaluable a where
-  eval :: a -> AResult Expression
+  eval :: a -> InterpreterT Expr
+  prettyEval :: a -> InterpreterT ()
+  prettyEval = undefined
 
-instance Evaluable LabeledStatement where
-  eval x = eval $ x ^. lensExpressionFromLabeledStatement
+instance Evaluable Expr where
+  eval x =
+    case x of
+      EAppend pos e es -> do
+        e' <- eval e
+        es' <- eval es
+        case es' of
+          Nil2 _ -> return $ List npos [e']
+          List _ elems -> return $ List npos $ e' : elems
+          _ -> bad pos $ "Expected a list, got " ++ show es'
+    -- This is a bad edge case ... I am sad to hardcode this...
+      EApply _ (VCanonical _ (CanonicalName _ [] i 0 [])) [e]
+        | i == ILowercase npos (LowercaseIdent "__typeof__") -> do
+          t <- typeOf e
+          _ <- eval e
+          return (from $ printTree t :: Expr)
+      EApply _ f es -> do
+        f' <- eval f
+        applyLambda f' es
+      EAssign _ v e -> do
+        mref <- getMemory v
+        case mref of
+          Nothing -> bad Nothing $ "Invalid reference " ++ printTree v
+          Just ref' -> do
+            e' <- eval e
+            saveRef ref' e'
+        return unit
+      EBegin _ e -> eval e
+      EConstant {} -> return x
+      EConstructor _ v e -> EConstructor npos v <$> eval e
+      EExternalLambda binding _ es -> do
+        es' <- mapM eval es
+        es'' <-
+          mapM
+            (\case
+               Reference ref -> liftIO $ fromIODeep ref
+               other -> return other)
+            es'
+        applyExternal binding es''
+      EFor _ (LetPattern _ (VCanonical _ name) e_start) dir e_end e_loop -> do
+        EConstant _ (CInteger _ i_start) <- eval e_start
+        EConstant _ (CInteger _ i_end) <- eval e_end
+        {- HLINT ignore "Use let" -}
+        cond <-
+          return
+            $ case dir of
+                ForTo _ -> (> i_end)
+                _ -> (< i_end)
+        let update i = do
+              context <- getContext
+              i' <-
+                liftIO
+                  $ newIORef
+                      (File
+                         ((from :: Integer -> Expr) i)
+                         (context ^. htypes . tinteger))
+              _ <- local (withLocal (name, i')) (eval e_loop)
+              return
+                $ case dir of
+                    ForTo _ -> i + 1
+                    _ -> i - 1
+        _ <- iterateUntilM cond update i_start
+        return unit
+      EIf _ condition expression -> do
+        b <- eval condition
+        if isTrue b
+          then eval expression
+          else return unit
+      EIfElse _ condition expression1 expression2 -> do
+        b <- eval condition
+        eval
+          $ if isTrue b
+              then expression1
+              else expression2
+      ELambda {} -> return x
+      ELetIn _ _ defs e -> do
+        locals <-
+          mapM
+            (\case
+               LetPattern pos v e2 ->
+                 case v of
+                   EApply _ (VCanonical _ name) es ->
+                     return [(name, toLambda es e2)]
+                   _ -> do
+                     e2' <- eval e2
+                     case match v e2' of
+                       Left err -> bad pos err
+                       Right matches -> return matches
+               _ -> undefined)
+            defs
+        prepare (concat locals) (eval e)
+      EMatch _ e _ patterns -> do
+        e' <- eval e
+        applyMatch e' patterns
+      EPartial {} -> applyLambda x []
+      ESeq _ e es -> last <$> mapM eval (e : es)
+      ETuple _ e es -> ETuple npos <$> eval e <*> mapM eval es
+      ETyped _ e _ -> eval e
+      EWhile _ condition expression -> do
+        whileM_ (isTrue <$> eval condition) (eval expression)
+        return unit
+      List _ es -> List npos <$> mapM eval es
+      Nil2 _ -> return $ Nil2 npos
+      Record _ fields ->
+        Record npos
+          <$> mapM
+                (\case
+                   EField _ v e -> EField npos (stripPosition v) <$> eval e
+                   other ->
+                     bad (hasPosition other)
+                       $ "Cannot evaluate record declaration " ++ show other)
+                fields
+      Reference {} -> return x
+      VCanonical {} -> do
+        mref <- getMemory x
+        mres <-
+          case mref of
+            Nothing -> bad Nothing "Variable not in memory"
+            Just ref -> Context.read [] ref
+        case mres of
+          Just e -> return e
+          _ -> bad Nothing "Read nothing"
+        `catchError` appendTrace (ERUnknown Nothing $ "Cannot read " ++ show x)
+      _ -> bad (hasPosition x) $ "Cannot evaluate " ++ show x
 
-instance Evaluable CanonicalName where
-  eval x = case x of
-    CanonicalName {} -> peekFromEnvironment x
-    CanonicalModule {} -> undefined {- It should never occur -}
+instance Evaluable Statement where
+  eval x =
+    case x of
+      Definition pos _ defs -> do
+        forM_ defs $ \case
+          LetPattern _ v e -> do
+            e' <- eval e
+            case match v e' of
+              Left err -> bad pos err
+              Right matches ->
+                forM_
+                  matches
+                  (\(name, e'') -> do
+                     save name e''
+                     let v' = VCanonical npos name
+                     t <- typeOf v'
+                     Context.log $ LogDefinition v' t e'')
+          other -> bad pos $ "Invalid definition " ++ show other
+        return unit
+      Directive2 pos (DirectiveIdent "#use") (EConstant _ (CString _ path)) -> do
+        context <- getContext
+        path' <- matchFilePath path
+        case path' of
+          Nothing -> bad Nothing $ "Could not find file: " ++ show path
+          Just path'' -> do
+            s <- liftIO $ Prelude.readFile path''
+            let s' = (context ^. hfiles . lexer) s
+            case (context ^. hfiles . parser) s' of
+              Left msg -> throwError $ ERParseFailed path'' msg
+              Right tree ->
+                local (setCurrentFile path'') (prettyEval tree)
+                  `catchError` (\e -> do
+                                  pos' <- getPosition pos
+                                  appendTrace
+                                    (ERUnknown pos'
+                                       $ "Use failed: "
+                                           ++ show path
+                                           ++ " resolving to "
+                                           ++ show path'')
+                                    e)
+        return unit
+      EndStmt _ stmt -> eval stmt
+      Exception _ (ConstrOf _ v@(VCanonical _ name) _) -> do
+        p <- local (setNameContext CtxLocal) (bind temporaryVariable)
+        let e = ELambda npos (Fun1 npos) [p] (EConstructor npos v p)
+        save name e
+        t <- typeOf v
+        Context.log $ LogDefinition v t e
+        return unit
+      Expression _ e -> do
+        e' <- eval e
+        t <- typeOf e'
+        Context.log $ LogOutput t e'
+        return unit
+      External _ (LetPattern _ (VCanonical _ name) expr) -> do
+        save name expr
+        return unit
+      Module pos (LetPattern _ (Variable _ [i@IUppercase {}]) (ModuleDefinition _ top)) -> do
+        local (setModuleName i . resetFlag FTraceInput) $ do
+          makeModule pos
+          prettyEval top
+        return unit
+      Module pos (LetPattern _ (ETyped _ (Variable _ [i@IUppercase {}]) (Variable _ sig)) (ModuleDefinition _ top)) -> do
+        local (setModuleName i . resetFlag FTraceInput) $ do
+          makeModule pos
+          prettyEval top
+          loadSignature (map stripPosition sig)
+        return unit
+      ModuleType _ (LetPattern _ (Variable _ [i@IUppercase {}]) (ModuleSignature _ top)) -> do
+        modpath <-
+          local (setModuleName i) $ getModuleName <&> map (IUppercase npos)
+        signatures <- local (setModuleName i) (extractSignatures top)
+        lift
+          $ modify
+          $ over (htypes . modulesignatures) (Map.insert modpath signatures)
+        return unit
+      Signature {} -> return unit
+      SLetIn pos rec defs e -> do
+        e' <- eval (ELetIn pos rec defs e)
+        t <- typeOf e'
+        Context.log $ LogOutput t e'
+        return unit
+      Typedef _ _ _ cases -> do
+        forM_ cases $ \case
+          VCanonical _ name ->
+            save name (EConstant npos $ CConstructor npos (to name :: Path))
+          ConstrOf _ v@(VCanonical _ name) _ -> do
+            p <- local (setNameContext CtxLocal) (bind temporaryVariable)
+            save name (ELambda npos (Fun1 npos) [p] (EConstructor npos v p))
+          Record {} -> return ()
+          other -> bad Nothing $ "Cannot evaluate typedef " ++ show other
+        return unit
+      _ -> bad Nothing $ "Unknown statement " ++ show x
+  prettyEval x = do
+    Context.log $ LogInput x
+    Context.log $ LogInputTree x
+    x' <- bind x
+    do
+      x'' <- resolve x'
+      Context.log $ LogInputVersion x''
+      x''' <- eval x''
+      case x'' of
+        Directive2 {} -> return ()
+        Module {} -> return ()
+        ModuleType {} -> return ()
+        _ -> Context.log $ LogOutputTree x'''
+      `catchError` appendTrace
+                     (ERUnknown (hasPosition x')
+                        $ "Cannot evaluate statement " ++ printTree x')
+    return ()
 
-instance Evaluable SimpleVariable where
-  eval x = case x of
-    VVariable names -> bad $ "Not canonical variable: " ++ show x
-    VBlank -> bad $ show x
-    VCanonical name -> eval name 
-
-instance Evaluable SequencingExpression where
-  eval x = case x of
-    ESeq e -> eval e
-    EAssign {} -> do
-      translate x
-      return ENull
-
-instance Evaluable Expression where
-  eval x = case x of
-    EConst constant -> 
-      return x
-    EString string -> 
-      return x
-    EVar variable -> 
-      eval variable
-    EReferenceMemory ptr -> 
-      return x -- [TODO] ?
-    EOp1 {} -> undefined -- It should not happen, after fvBind.
-    EOp2 {} -> undefined
-    ERecord lstmts -> do
-      exprs <- forM lstmts eval
-      return $ applyRecord lstmts exprs
-    EIfThenElse condition expression1 expression2 -> do
-      b <- eval condition
-      eval $ if isTrue b then expression1 else expression2
-    EMatch simplevariables matchings -> do
-      es <- forM simplevariables (eval . EVar. VSimple)
-      let e = applyTuple es
-      applyMatch e matchings
-    ETypeOf expression -> 
-      applyTypeOf expression
-    ELocalDefinition definition expression -> do
-      lstmt <- toLabeledStatementFromDefinition definition
-      lstmt' <- case lstmt of
-        SLabeled v ELambda{} -> return lstmt
-        SLabeled v e -> SLabeled v <$> eval e
-      withLocal lstmt' $ eval expression
-    EStack seq -> last <$> forM seq eval
-    EFor var e_start to e_end e_loop -> do
-      EConst (EInt i_start) <- eval e_start
-      EConst (EInt i_end) <- eval e_end
-      let step i = withLocal (SLabeled var (EConst (EInt i))) (eval $ EStack e_loop)
-      let (cond, update) = if to == ForTo 
-                           then ((> i_end), (+1)) 
-                           else ((< i_end), \i -> i - 1)
-      iterateUntilM cond (\i -> do step i; return $ update i) i_start
-      return ENull
-    EWhile condition expressions -> do
-      whileM_ (isTrue <$> eval condition) (eval $ EStack expressions)
-      return ENull
-    EFunctionCall variable expressions -> do {
-        pushToOstreamFlagged FTraceFunctionCalls $ "Calling " ++ printTree variable ++ " on " ++ printTree expressions;
-        f <- eval variable;
-        applyFunctionCall f expressions
-      } `catchError` appendTrace (
-        ERUnknown $ "Function call failed: " ++ printTree variable ++ "\n with arguments: " ++ printTree expressions
-      )
-    EExternalFunctionCall binding expressions -> do {
-      es' <- forM expressions eval;
-      evalExternal binding es'
-    } `catchError` appendTrace (
-      ERUnknown $ "External function call failed: " ++ show binding ++ "\n with arguments: " ++ printTree expressions
-     )
-    ETuple expressions -> do
-      es <- forM expressions eval
-      -- assert $ length expressions > 1 ?
-      return $ applyTuple es
-    ENamedTuple constructorname expressions -> do
-      es <- forM expressions eval
-      return $ ENamedTuple constructorname es
-    ERecursiveFunctionCall variable expressions expression -> do
-      f <- eval variable
-      -- TODO  99_EitherList: Allow lazy evaluations when merging lists: List rec (..., l1).
-      es <- forM expressions eval
-      e <- eval expression
-      applyFoldrFunctionCall f es e
-    ELambda functionprefix matching -> 
-      return x
-    ERaise exceptionname expression -> do
-      let NException (Ident name) = exceptionname
-      te <- eval expression
-      throwError $ ERException name (printTree te)
-    _ -> error (show x)
-
-instance Evaluable Variable where
-  eval x = case x of
-    VSimple simplevariable -> eval simplevariable
-    VOpTuple tupleconstr -> return . EVar $ x
-    VOp op -> undefined -- It should not occur.
-    VConstructor names -> return . EVar $ x
- 
--- Interpreters
-
-class Translatable a where
-  translate :: a -> Result
-
-instance Translatable ModuleContent where
-  translate x = do
-    lstmt <- local setNoOutput (toLabeledStatementFromModuleContent x) >>= typeBindLabeled
-    case lstmt of
-      SLabeledBound v i e -> do
-        stmt <- SLabeledBound v i <$> eval e
-        scope <- askE
-        when (scope^.isprinting) (do traceOutputLabeledStatement stmt; return ())
-        pushToEnvironment stmt
-      _ -> badInternal 4 $ "translate (ModuleContent) error. Labeled statement not bound: " ++ show x
-
-instance Translatable Prog where
-  translate (Prog1 statements) = forM_ statements transProgStatement
-
-transProgStatement :: Statement -> Result
-transProgStatement s = do 
-  traceInput s
-  pushToOstreamFlagged FTraceInputTree $ " input: " ++ show s
-  fvs <- fvBind s
-  pushToOstreamFlagged FTraceInputVersion $ "   ver: " ++ show fvs
-  unless (isModuleDocs fvs) $ do
-    t <- typeResolveStatement fvs
-    case t of 
-      Just x -> pushToOstream $ "  type: " ++ printTree x
-      Nothing -> pushToOstream "unit"
-  -- traceEnvironment
-  translate (fvs :: Statement)
-
-instance Translatable Signature where
-  translate (Signature1 variable type_) = do -- TODO. this should be in StaticBinding.hs 
-    v <- local setNext (fvBind variable) -- TODO debug, it will probably break in local nested statements
-    case v of
-      VSimple (VCanonical (CanonicalName cindex _ _)) -> do
-        let type_' = typeFlatten type_
-        typeAssign v type_'
-        fvUnbind cindex
-      _ -> bad $ "Unable to bind variable... " ++ printTree v
-
-instance Translatable SequencingExpression where
-  translate x = case x of
-    EAssign (VSimple (VCanonical name)) expression -> do
-      e' <- eval expression
-      pushAssign name e'
-    _ -> bad "Expected canoncial name."
-
-instance Translatable Expression where
-  translate x = case x of
-    EVar (VSimple (VCanonical m@(CanonicalModule mname))) ->
-      traceModuleDocs m
-    _ -> do
-      traceOutput $ eval x
-      return ()
-
-translateModule :: Maybe (Map.Map Ident Type) -> [ModuleContent] -> AResult [(Ident, OpenTerm)]
-translateModule interface contents =
-    -- [TODO] Modules are also versioned ...
-  forM contents $ \mc -> do
-    lstmt <- toLabeledStatementFromModuleContent mc
-    -- Workaround: setNext ensures that no new IntVar is created.
-    lstmt <- local setNext (typeBindLabeled lstmt)
-    case lstmt of
-      SLabeledBound v@(VSimple (VCanonical name@(CanonicalName (_, ident) _ _))) i e -> do
-        -- Unifies signature, when it exists.
-        forM_ (interface >>= Map.lookup ident) $ typeUnifySignature i name
-
-        lstmt <- SLabeledBound v i <$> eval e
-        pushToEnvironment lstmt
-        return (ident, fromIntToTerm i)
-      _ -> undefined
-
-instance Translatable Statement where
-  translate x = case x of
-    SDirective filename -> 
-      return () -- Directives are preprocessed
-    SEnable flag ->
-      flagEnable flag
-    SExpression expression -> 
-      translate expression
-    SExpressionWithType expression type_ -> do
-      traceOutput $ eval expression
-      return ()
-    SSignature signature1 ->
-      translate signature1
-    STypedef {} ->
-      pushTypedef x
-    SModuleContent modulecontent ->
-      translate modulecontent
-    SModuleSignature name signatures1 -> do
-      let signatures1' = map (\(Signature1 v t) -> Signature1 v (typeFlatten t)) signatures1
-      modify $ over (hmodules . signatures) (Map.insert name signatures1')
-    SModuleDefinition smodule modulecontents -> do
-      interface <- typeGetInterface smodule
-      let modname = smodule ^. lensNameFromModuleName
-      terms <- local (setNoOutput . setModuleName modname) $
-        translateModule (Map.fromList <$> interface) modulecontents
-      typeResolveConstraints
-      typeCheckSignatures interface (Map.fromList terms)
-
--- External functions
-evalExternal :: String -> [Expression] -> AResult Expression
-evalExternal binding exprs = case (binding, exprs) of
-  -- TODO It should check types....
-  ("ocaml_neg_int", [e]) -> applyPrefixOp "-" e
-  ("ocaml_add_int", [e1, e2]) -> applyInfixOp "+" e1 e2
-  ("ocaml_sub_int", [e1, e2]) -> applyInfixOp "-" e1 e2
-  ("ocaml_mul_int", [e1, e2]) -> applyInfixOp "*" e1 e2
-  ("ocaml_div_int", [e1, e2]) -> applyInfixOp "/" e1 e2
-  ("ocaml_mod_int", [e1, e2]) -> applyInfixOp "mod" e1 e2
-
-  ("ocaml_mul_float", [e1, e2]) -> applyInfixOp "*" e1 e2
-
-  ("ocaml_lt", [e1, e2]) -> applyBoolInfixOp "<" e1 e2
-  ("ocaml_lte", [e1, e2]) -> applyBoolInfixOp "<=" e1 e2
-  ("ocaml_gt", [e1, e2]) -> applyBoolInfixOp ">" e1 e2
-  ("ocaml_gte", [e1, e2]) -> applyBoolInfixOp ">=" e1 e2
-  ("ocaml_eq", [e1, e2]) -> applyBoolInfixOp "==" e1 e2
-  _ -> bad $ "Function binding not available: " ++ binding
+instance Evaluable Toplevel where
+  eval x = do
+    case x of
+      Toplevel1 _ s -> mapM_ eval s
+      Toplevel2 {} -> undefined
+    return unit
+  prettyEval x =
+    case x of
+      Toplevel1 _ s -> mapM_ prettyEval s
+      Toplevel2 pos e s -> mapM_ prettyEval (Expression pos e : s)

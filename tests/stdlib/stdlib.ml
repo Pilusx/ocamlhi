@@ -20,40 +20,47 @@
 (*     https://github.com/ocaml/ocaml/blob/trunk/LICENSE                  *)
 (**************************************************************************)
 
--- Prefix operators
-val (~+) of int -> int;;
-let (~+) x = x;;
-external (~-) : int -> int = "ocaml_neg_int";;
+external raise : exn -> 'a = "%raise"
 
--- Infix operators
-external (+) : int -> int -> int = "ocaml_add_int";;
-external (-) : int -> int -> int = "ocaml_sub_int";;
-external (*) : int -> int -> int = "ocaml_mul_int";;
-external (%) : int -> int -> int = "ocaml_mod_int";;
-external (/) : int -> int -> int = "ocaml_div_int";;
-external (mod) : int -> int -> int = "ocaml_mod_int";;
+(* Prefix operators *)
+external ( ~+ ) : int -> int = "%identity"
+external ( ~- ) : int -> int = "%negint"
+external ( ~+. ) : float -> float = "%identity"
+external ( ~-. ) : float -> float = "%negfloat"
+external not : bool -> bool = "%boolnot"
 
-external (*.) : float -> float -> float = "ocaml_mul_float";;
+(* Infix operators *)
+external ( + ) : int -> int -> int = "%addint"
+external ( - ) : int -> int -> int = "%subint"
+external ( * ) : int -> int -> int = "%mulint"
+external ( / ) : int -> int -> int = "%divint"
+external ( % ) : int -> int -> int = "%modint"
+external ( +. ) : float -> float -> float = "%addfloat"
+external ( -. ) : float -> float -> float = "%subfloat"
+external ( *. ) : float -> float -> float = "%mulfloat"
+external ( /. ) : float -> float -> float = "%divfloat"
+external ( < ) : 'a -> 'a -> bool = "%lessthan"
+external ( <= ) : 'a -> 'a -> bool = "%lessequal"
+external ( > ) : 'a -> 'a -> bool = "%greaterthan"
+external ( >= ) : 'a -> 'a -> bool = "%greaterequal"
+external ( == ) : 'a -> 'a -> bool = "%eq"
+external ( <> ) : 'a -> 'a -> bool = "%notequal"
 
-external (<)  : `a -> `a -> bool = "ocaml_lt";;
-external (<=) : `a -> `a -> bool = "ocaml_lte";;
-external (>)  : `a -> `a -> bool = "ocaml_gt";;
-external (>=) : `a -> `a -> bool = "ocaml_gte";;
-external (==) : `a -> `a -> bool = "ocaml_eq";;
+let id x = x
+let max a b = if a < b then b else a
+let min a b = if a < b then a else b
 
-val not of bool -> bool;;
-let not x = if x then {false} else {true};;
+type 'a ref = { mutable contents : 'a }
 
-val (<>) of `a -> `a -> bool;;
-let (<>) x y = not((x == y));;
+let ref (x : 'a) : 'a ref = { contents = x }
+let ( ! ) (x : 'a ref) : 'a = x.contents
+let ( := ) (x : 'a ref) (e : 'a) : unit = x.contents <- e
 
-type `a ref = {mutable contents : `a};;
+external __tostring__ : 'a -> string = "to_string"
+external __debug__ : unit -> bool = "debug"
 
-val ref of `a -> `a ref;;
-let ref x = {contents=x};;
+let __DEBUG__ = __debug__ ()
 
-val (!) of `a ref -> `a;;
-let (!) x = x.contents;;
+external __typeof__ : 'a -> string = "type_of"
 
-val (:=) of `a ref -> `a -> unit;;
-let (:=) x e = begin x.contents <- e end;;
+exception Exception of string

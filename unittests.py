@@ -1,3 +1,4 @@
+#!/usr/bin/python3
 '''
 Testing framework.
 '''
@@ -49,7 +50,7 @@ class Statistics:
         '''
         score = self.score[name]
         total = self.total[name]
-        print(Colors.success(score == total, "{}: {}/{}".format(message, score, total)))
+        print(Colors.success(score == total, f"{message}: {score}/{total}"))
 
     def summarize(self):
         '''
@@ -104,17 +105,22 @@ class OcamlTest:
         Executes one of the files and checks its output.
         '''
         result = self.default_result()
+        stdlib = os.path.join("tests", "stdlib")
+        if self.subdirectory == "stdlib":
+            srcflag = ""
+        else:
+            srcflag = "-I " + os.path.join("tests", self.subdirectory)
         src = os.path.join("tests", self.subdirectory, self.file)
         out = os.path.join(OUT, self.file.replace(".ml", ""))
-        os.system("./ocamlhi -s {} > {} 2>&1".format(src, out))
-        with open(src, "r") as file:
+        ret = os.system(f"./ocamlhi -I {stdlib} {srcflag} {self.file} > {out} 2>&1")
+        with open(src, "r", encoding="utf8") as file:
             lines = file.readlines()
-            issues = self.file_contains_pattern(lines, r'-- \[ISSUE\] (.*)')
-            result["issue"] = issues[0] + " (1 of {})".format(len(issues)) if issues else ""
-        with open(out, "r") as file:
+            issues = self.file_contains_pattern(lines, r'\(\* \[ISSUE\] (.*) \*\)')
+            result["issue"] = f"{issues[0]} (1 of {len(issues)})" if issues else ""
+        with open(out, "r", encoding="utf8") as file:
             lines = file.readlines()
-            result["parsed"] = self.file_contains_string(lines, "Parse Successful!")
-            result["interpreted"] = self.file_contains_string(lines, "Interpreter Successful")
+            result["parsed"] = not self.file_contains_string(lines, r'\[EPARSEFAILED\]')
+            result["interpreted"] = ret == 0
 
         queue.put(result)
 
@@ -143,7 +149,9 @@ def over_directory(directory):
     Executes all possible tests in the given @directory.
     '''
     for file in sorted(os.listdir(os.path.join("tests", directory))):
-        yield file, OcamlTest(directory, file).run_test()
+        if file[-2:] == "ml":
+            if not (directory == "stdlib" and file == "stdlib.ml"):
+                yield file, OcamlTest(directory, file).run_test()
 
 class SuiteRunner:
     '''
@@ -189,8 +197,11 @@ class SuiteRunner:
     def start(self):
         '''
         Header of the suite's log.
+        Those special chars are necessary to correct the width of column.
         '''
-        print(self.fmt.format("Parsed", "Interpreted", "Suite", "Filename", "FIXME"))
+        print('''Parsed
+   | Interpreted
+''' + self.fmt.format("", "", "Suite", Colors.OKGREEN + Colors.ENDC + "Filename", "FIXME"))
 
     def end(self):
         '''
@@ -245,7 +256,7 @@ class JudgeBad(IJudge):
 
     @staticmethod
     def countable(category):
-        return category in ['timelimit', 'accepted'] # ['parsed']?
+        return category in ['parsed', 'timelimit', 'accepted']
 
 if __name__ == '__main__':
     if not os.path.exists(OUT):

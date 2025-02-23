@@ -1,40 +1,87 @@
 --
 -- This file contains user-configurable flags.
--- They can be enabled using the #enable <flag> statement.
 --
-
 module Flags where
 
-import Data.Bimap
 import qualified Data.Set as Set
 
-data Flag 
-  = FTraceInputTree 
-  | FTraceInputVersion 
-  | FTraceOutputTree
+import Grammar
+import Operators ()
+
+data Flag
+  = FTraceExecutionStatistics
+  | FTraceHello
+  | FTraceInput
+  | FTraceInputTree
+  | FTraceInputVersion
   | FTraceTypeConstraints
-  | FTraceFunctionCalls
-  | FTraceExecutionStatistics
+  | FTraceOutput
+  | FTraceOutputTree
+  | FUseLogBuffer
   deriving (Eq, Ord)
 
-availableFlags :: Bimap String Flag
-availableFlags = fromList [
-  ("trace-input-tree", FTraceInputTree),
-  ("trace-input-version", FTraceInputVersion),
-  ("trace-output-tree", FTraceOutputTree),
-  ("trace-type-constraints", FTraceTypeConstraints),
-  ("trace-function-calls", FTraceFunctionCalls),
-  ("trace-execution-statistics", FTraceExecutionStatistics)
-  ]
-
-allFlags :: [Flag]
-allFlags = keysR availableFlags
-
-defaultFlags :: Set.Set Flag
-defaultFlags = Set.fromList [FTraceExecutionStatistics]
-
 instance Show Flag where
-  show f = availableFlags !> f
+  show flag =
+    case flag of
+      FTraceExecutionStatistics -> "trace-execution-statistics"
+      FTraceHello -> "trace-hello"
+      FTraceInput -> "trace-input"
+      FTraceInputTree -> "trace-input-tree"
+      FTraceInputVersion -> "trace-input-version"
+      FTraceTypeConstraints -> "trace-type-constraints"
+      FTraceOutput -> "trace-output"
+      FTraceOutputTree -> "trace-output-tree"
+      FUseLogBuffer -> "use-log-buffer"
 
-readFlag :: String -> Flag
-readFlag s = availableFlags ! s
+flagDescription :: Flag -> String
+flagDescription flag =
+  case flag of
+    FTraceExecutionStatistics ->
+      "Print execution statistics at the end of the program. "
+        ++ "Statistics include allocated pointers and used 'fresh variables'."
+    FTraceHello ->
+      "Print the ASCII image before executing any actions. If not used a simplified message of version is displayed."
+    FTraceInput ->
+      "Print the input statements. Example: " ++ "(ocaml) let x = 3"
+    FTraceInputTree ->
+      "Print input trees after each global statement. Example: "
+        ++ "input: "
+        ++ show (Variable npos [ILowercase npos $ LowercaseIdent "x"] :: Expr)
+    FTraceInputVersion ->
+      "Print input tree with bound variables after each global statement. Example: "
+        ++ "ver: "
+        ++ show
+             (VCanonical
+                Nothing
+                (CanonicalName
+                   TagExpression
+                   []
+                   (ILowercase npos $ LowercaseIdent "x")
+                   0
+                   []) :: Expr)
+    FTraceTypeConstraints ->
+      "Print all constraints found during type resolution stage."
+    FTraceOutput ->
+      "Prints the result of definition or expression. When disabled it also disables a flag 'trace-output-tree'. Example: "
+        ++ "   val: x\v.0 : int = 3"
+    FTraceOutputTree ->
+      "Print the tree of the result. Example: "
+        ++ "output: "
+        ++ show ((from :: Integer -> Expr) 3)
+    FUseLogBuffer ->
+      "Log all data to the internal buffer. All logs have to be manually extracted. "
+        ++ "It is only working in the webserver for sending logs as json."
+
+allFlags :: Set.Set Flag
+allFlags =
+  Set.fromList
+    [ FTraceHello
+    , FTraceInput
+    , FTraceInputTree
+    , FTraceInputVersion
+    , FTraceTypeConstraints
+    , FTraceOutput
+    , FTraceOutputTree
+    , FTraceExecutionStatistics
+    , FUseLogBuffer
+    ]

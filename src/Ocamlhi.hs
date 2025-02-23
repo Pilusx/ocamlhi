@@ -1,92 +1,149 @@
 --
 -- This file is responsible 'mainly' for argument parsing.
 --
+{-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE NoCPP #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE QuasiQuotes #-}
+
 module Main where
 
-import Control.Monad (forM_)
+import Control.Lens ((^.))
 import Control.Monad.Except (catchError, runExceptT)
-import Control.Monad.Reader (runReaderT)
-import Control.Monad.Trans.State (execStateT, runStateT)
-import System.Environment (getArgs)
+import Control.Monad.Reader (liftIO, local, runReaderT)
+import Control.Monad.Trans.State (runStateT)
+
+import Data.Aeson (Value(..), (.=), object)
+import Data.Aeson.Encode.Pretty
+import qualified Data.ByteString.Lazy.Char8 as B
+import qualified Data.Set as Set
+import Data.Version (showVersion)
+import Exon (exon)
+import Options.Applicative
 import System.Exit (exitFailure, exitSuccess)
 
-import Context
-import Dependencies
-import ErrM
+import Context hiding (Parser)
+import Flags
 import Grammar
-import Initializable
 import Interpreter
-import PrintOcaml
-import TopologicalSort (topologicalSort)
+import Operators ()
+import Paths_ocamlhi (version)
 
--- Main function
-class (Show a, Print a) => Entrypoint a where
-  enter :: a -> Result
-  enter x = failure $ "This type is not an entrypoint" ++ show x
-  
-  interpret :: a -> IO ()
-  interpret x = error $ "This type is not an entrypoint" ++ show x
+data Options = Options
+  { includes :: [String]
+  , nodefaultflags :: Bool
+  , flags :: [Flag]
+  , file :: Maybe String
+  } deriving (Show)
 
-  showTree :: Verbosity -> a -> IO ()
-  showTree v tree = do
-    putStrV v $ "\n[Abstract Syntax]\n\n" ++ show tree
-    putStrV v $ "\n[Linearized tree]\n\n" ++ printTree tree
+instance Iso Options Value where
+  to x =
+    object
+      [ "includes" .= includes x
+      , "flags" .= map show (Main.flags x)
+      , "file" .= file x
+      , "no-default-flags" .= nodefaultflags x
+      ]
+  from = undefined
 
-  run :: Verbosity -> a -> IO ()
-  run v tree = do 
-    putStrLn "\nParse Successful!"
-    showTree v tree
-    putStrLn "\n[Interpretation]\n"
-    interpret tree
-    exitSuccess
+-- Flags
+flagOption :: Parser Flag
+flagOption =
+  foldl1 (<|>) (map toOption $ Set.toList $ Set.delete FUseLogBuffer allFlags)
+  where
+    toOption :: Flag -> Parser Flag
+    toOption f = flag' f (long (show f) <> help (flagDescription f))
 
-instance Entrypoint Prog where
-  enter x = do { 
-    translate x; 
-    pushToOstream "Interpreter Successful\n";
-    traceExecutionStatistics
-    } `catchError` traceTrace
+fileOption :: Parser String
+fileOption = argument str (metavar "FILE" <> help "File to interpret.")
 
-  interpret tree = do
-    let prog = enter tree
-    let context = initial :: Context
-    let scope = Ok (initial :: Scope)
-    runExceptT $ runReaderT (runStateT prog context) scope
-    return ()
+includeOption :: Parser String
+includeOption =
+  strOption
+    (short 'I'
+       <> long "include"
+       <> metavar "INCLUDE_DIR"
+       <> help
+            "Standard library and other files will be loaded from this directory.")
 
-runFile :: Verbosity -> FilePath -> IO ()
-runFile v f = do
-  let context = initial {_dsverbosity=v} :: DependenciesState
-  res <- runExceptT $ execStateT (findDependencies f) context
-  case res of
-    Left error -> do
-      print error
-      exitFailure
-    Right (DependenciesState g _ _ _) -> do
-      let order = topologicalSort $ getDependencies g
-      let source = getSource g order 
-      putStrLn f
-      putStrLn "[Dependencies]\n" 
-      forM_ order putStrLn
-      run v source
+nodefaultflagsOption :: Parser Bool
+nodefaultflagsOption =
+  switch
+    (short 'f' <> long "no-default-flags" <> help "Do not use default flags.")
 
-usage :: IO ()
-usage = do
-  putStrLn $ unlines
-    [ "usage: Call with one of the following argument combinations:"
-    , "  --help          Display this help message."
-    , "  (no arguments)  Parse stdin verbosely." -- [TODO] It is probably broken now..
-    , "  (files)         Parse content of files verbosely."
-    , "  -s (files)      Silent mode. Parse content of files silently."
-    ]
-  exitSuccess
+versionOption :: Parser (a -> a)
+versionOption =
+  infoOption (showVersion version) (long "version" <> help "Show version.")
 
-{-# ANN main "HLint: ignore Use getContents" #-}
+optionsParser :: ParserInfo Options
+optionsParser =
+  info
+    (helper <*> versionOption <*> programOptions)
+    (fullDesc <> header "ocamlhi - Caml interpreter written in Haskell"
+      -- <> progDesc "" 
+      -- <> footer ""
+     )
+
+programOptions :: Parser Options
+programOptions =
+  Options
+    <$> many includeOption
+    <*> nodefaultflagsOption
+    <*> many flagOption
+    <*> optional fileOption
+
+read :: String -> InterpreterT Toplevel
+read code = do
+  context <- getContext
+  let lexer' = context ^. hfiles . lexer
+  let parser' = context ^. hfiles . parser
+  case parser' . lexer' $ code of
+    Left msg -> bad Nothing $ show msg
+    Right tree -> return tree
+
+interpretFile :: FilePath -> InterpreterT ()
+interpretFile path = do
+  _ <-
+    local
+      (setCurrentFile "toplevel"
+         . resetFlag FTraceInput
+         . resetFlag FTraceOutput)
+      (Main.read [exon|#use "stdlib.ml"|] >>= prettyEval)
+  _ <-
+    local
+      (setCurrentFile "toplevel")
+      (Main.read [exon|#use "#{path}"|] >>= prettyEval)
+  traceExecutionStatistics
+  `catchError` (\e -> do
+                  Context.log $ LogError e
+                  liftIO exitFailure)
+
 main :: IO ()
 main = do
-  args <- getArgs
-  case args of
-    ["--help"] -> usage
-    "-s":fs -> mapM_ (runFile 0) fs
-    fs -> mapM_ (runFile 2) fs
-
+  opts <- execParser optionsParser
+  flags' <-
+    if nodefaultflags opts
+      then return . Set.fromList . Main.flags $ opts
+      else initial
+  print
+    $ if Set.member FTraceHello flags'
+        then LogHelloImage
+        else LogHello
+  B.putStrLn . encodePretty
+    $ (to $ opts {Main.flags = Set.toList flags'} :: Value)
+  scope <- initial
+  context <- initial
+  let filehandler = context ^. hfiles
+  let filehandler' = filehandler {_includeddirectories = includes opts}
+  let context' = context {_hfiles = filehandler'}
+  let scope' = scope {Context._flags = flags'}
+  case file opts of
+    Nothing -> do
+      putStrLn "Interactive mode is not implemented."
+      exitFailure
+    Just path -> do
+      _ <-
+        runReaderT
+          (runStateT (runExceptT (interpretFile path)) context')
+          (Right scope')
+      exitSuccess

@@ -1,0 +1,4 @@
+tests/good/10_Mergesort.ml
+tests/stdlib/assert.ml
+tests/stdlib/math.ml
+tests/stdlib/tree.ml
